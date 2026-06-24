@@ -1,17 +1,22 @@
-# droid — Unified Android Device Management CLI
+# droid — Unified Companion Device Interface
 
-A unified command-line tool for managing Android devices from Linux — ADB, SSH, screen mirroring (scrcpy), app management, debloat, KDE Connect, and more.
+Turn your Android device into a tightly integrated companion — offload tasks,
+mirror its screen, manage apps, tap into its network, and control it remotely
+as if it were part of your workstation.
 
 ## Features
 
-- **Device control** — SSH, shell, wake/sleep, reboot, mount, home key
-- **Screen mirroring** — scrcpy with bitrate/workspace options, DeX mode
+- **Companion status** — one-shot overview of device health, data link, and offload capabilities
+- **Remote shell & exec** — run commands on device via SSH or ADB
+- **Screen mirroring** — scrcpy with bitrate/workspace config, DeX mode
 - **App management** — list, install, uninstall, launch via fuzzel picker
 - **Debloat** — profile-based package removal (generic, samsung)
 - **Modules** — list, flash, remove Magisk/KSU modules
-- **Network** — ADB tunnel toggle, Kiwix offline wiki, KDE Connect
+- **Network offload** — ADB tunnel, Kiwix offline wiki, KDE Connect
 - **Clipboard** — push/pull to/from device
-- **Info & monitoring** — device info, host info, one-shot status dashboard
+- **Mount** — access phone filesystem via SSHFS
+- **DroidSpaces containers** — run Linux containers on device
+- **Info & monitoring** — device info, host info, companion status
 - **Keyboard-navigable menu** — default interactive interface with arrow/jk navigation
 
 ## Quick start
@@ -22,7 +27,38 @@ cd droid
 python3 droid --help
 ```
 
-First run will auto-detect your device. Run `droid init` to probe connection settings and create `~/.config/droid/config.json`.
+First run will auto-detect your device. Run `droid init` to probe connection
+settings and create `~/.config/droid/config.json`.
+
+## Usage
+
+```text
+droid                          Keyboard-navigable menu (default)
+droid dashboard                Textual TUI dashboard
+droid companion                Companion status overview
+droid companion shell          Open shell on device
+droid companion exec <cmd>     Run command on device
+droid companion share file     Send file to device
+droid companion tunnel on|off  Route traffic through device
+droid info                     Extended device info
+droid mirror [--bitrate 8M]   Screen mirroring with scrcpy
+droid init                     Auto-detect and save config
+droid host                     Show local machine info
+droid devices                  List ADB devices
+droid switch                   Switch active device via fzf
+```
+
+## Menu sections
+
+| Section      | Purpose |
+|-------------|---------|
+| **Link**    | SSH, shell, mount — establish a connection to the companion |
+| **Mirror**  | scrcpy sessions, DeX mode, screen recording |
+| **Offload** | Run commands, manage apps, debloat, modules |
+| **Control** | Wake, sleep, home, reboot, info |
+| **Network** | Tunnel, Kiwix, KDE Connect — companion network services |
+| **Container** | DroidSpaces container access |
+| **System**  | Device/host info, companion status, clipboard |
 
 ## Dependencies
 
@@ -39,22 +75,10 @@ First run will auto-detect your device. Run `droid init` to probe connection set
 - `rich` — Default panel output (installed with `pip install rich`)
 - `textual` — TUI dashboard (`droid dashboard`)
 
-## Usage
-
-```text
-droid                          Keyboard-navigable menu (default)
-droid dashboard                Textual TUI dashboard
-droid info                     Extended device info
-droid mirror [--bitrate 8M]   Screen mirroring with scrcpy
-droid init                     Auto-detect and save config
-droid host                     Show local machine info
-droid devices                  List ADB devices
-droid switch                   Switch active device via fzf
-```
-
 ## Config
 
-Config at `~/.config/droid/config.json` — auto-created by `droid init`. See `config.example.json` for the full structure.
+Config at `~/.config/droid/config.json` — auto-created by `droid init`.
+See `config.example.json` for the full structure.
 
 ## License
 

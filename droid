@@ -1400,6 +1400,190 @@ def cmd_init(args):
             bold(msg)
 
 
+def cmd_companion(args):
+    """Unified companion interface — offload tasks to your phone"""
+    cfg = load_config()
+    conn = resolve_connection(cfg)
+    serial = require_adb(cfg)
+
+    action = args.companion_action or "status"
+
+    if action == "status":
+        _companion_status(cfg, conn, serial)
+    elif action == "shell":
+        _companion_shell(cfg, conn, serial)
+    elif action == "exec":
+        _companion_exec(cfg, conn, serial, args.cmd)
+    elif action == "share":
+        _companion_share(cfg, conn, serial, args.share_target)
+    elif action == "tunnel":
+        _companion_tunnel(cfg, conn, serial, args.tunnel_action)
+
+
+def _companion_status(cfg, conn, serial):
+    """Show companion health — connection, resources, services"""
+    kwargs = dict(capture_output=True, text=True, timeout=5)
+
+    r_batt = subprocess.run(["adb", "-s", serial, "shell",
+                             "dumpsys battery | grep level:"], **kwargs)
+    batt = '?'
+    for line in r_batt.stdout.splitlines():
+        if 'level:' in line:
+            batt = line.split(':')[1].strip() + '%'
+
+    r_ip = subprocess.run(["adb", "-s", serial, "shell",
+                           "ip -4 a show wlan0 2>/dev/null | grep inet"], **kwargs)
+    ip = '?'
+    for line in r_ip.stdout.splitlines():
+        parts = line.strip().split()
+        if parts and len(parts) > 1:
+            ip = parts[1].split('/')[0]
+
+    r_df = subprocess.run(["adb", "-s", serial, "shell",
+                           "df -h /data 2>/dev/null | tail -1"], **kwargs)
+    storage = '?'
+    parts = r_df.stdout.strip().split()
+    if len(parts) >= 4:
+        storage = f"{parts[2]} used / {parts[3]} total"
+
+    services = []
+    if conn.ssh_port:
+        services.append(f"SSH :{conn.ssh_port}")
+    r_ss = subprocess.run(["ss", "-tulpn"], capture_output=True, text=True)
+    if ":1080" in r_ss.stdout:
+        services.append("SOCKS5 :1080")
+
+    r_model = subprocess.run(["adb", "-s", serial, "shell",
+                              "getprop ro.product.model"], **kwargs)
+    model = r_model.stdout.strip() or '?'
+
+    r_sdk = subprocess.run(["adb", "-s", serial, "shell",
+                            "getprop ro.build.version.sdk"], **kwargs)
+    sdk = r_sdk.stdout.strip() or '?'
+    android = {"35": "15", "36": "16"}.get(sdk, sdk)
+
+    if RICH:
+        from rich.table import Table
+        from rich.panel import Panel
+        from rich.console import Console
+        c = Console()
+
+        grid = Table.grid(padding=(0, 2))
+        grid.add_column()
+        grid.add_column()
+
+        # Device info
+        dev = Table.grid(padding=(0, 1))
+        dev.add_column()
+        dev.add_row(f"[bold cyan]Companion Device[/]")
+        dev.add_row(f"  [yellow]Model[/]      {model}")
+        dev.add_row(f"  [yellow]Battery[/]    {batt}")
+        dev.add_row(f"  [yellow]Android[/]    {android}")
+        dev.add_row(f"  [yellow]IP[/]         {ip}")
+        dev.add_row(f"  [yellow]Storage[/]    {storage}")
+        dev.add_row(f"  [yellow]Serial[/]     {serial}")
+
+        # Link info
+        link = Table.grid(padding=(0, 1))
+        link.add_column()
+        link.add_row(f"[bold cyan]Data Link[/]")
+        link.add_row(f"  [yellow]ADB[/]       {'✅ Connected' if conn.adb_serial else '❌ Not connected'}")
+        link.add_row(f"  [yellow]SSH[/]       {'✅ Port ' + str(conn.ssh_port) if conn.ssh_port else '❌ Not configured'}")
+        link.add_row(f"  [yellow]Tunnel[/]    {'🔒 Active' if ':1080' in r_ss.stdout else '🔓 Inactive'}")
+        link.add_row(f"")
+
+        # Services
+        svc = Table.grid(padding=(0, 1))
+        svc.add_column()
+        svc.add_row(f"[bold cyan]Offload Capabilities[/]")
+        svc.add_row(f"  [yellow]Shell[/]      Remote shell (SSH/ADB)")
+        svc.add_row(f"  [yellow]Exec[/]       Run commands on device")
+        svc.add_row(f"  [yellow]Mount[/]      Filesystem access via SSHFS")
+        svc.add_row(f"  [yellow]Mirror[/]     Screen mirroring (scrcpy)")
+        svc.add_row(f"  [yellow]Tunnel[/]     Route traffic through device")
+
+        split = Table.grid(expand=True)
+        split.add_column(ratio=1)
+        split.add_column(ratio=1)
+        split.add_row(Panel(dev, border_style="blue"), Panel(link, border_style="green"))
+        c.print(split)
+        c.print(Panel(svc, border_style="cyan", title="Companion Overview"))
+    else:
+        print(f"\n  ── Companion Status ──")
+        print(f"  Model:    {model}")
+        print(f"  Battery:  {batt}")
+        print(f"  Android:  {android}")
+        print(f"  IP:       {ip}")
+        print(f"  Storage:  {storage}")
+        print(f"  ADB:      {'OK' if conn.adb_serial else 'N/A'}")
+        print(f"  SSH:      {'OK' if conn.ssh_port else 'N/A'}")
+
+
+def _companion_shell(cfg, conn, serial):
+    """Open interactive shell on companion device"""
+    if conn.ssh_port and conn.ip:
+        cmd = ["ssh", f"{conn.ssh_user}@{conn.ip}", "-p", str(conn.ssh_port)]
+        if conn.ssh_key:
+            cmd += ["-i", conn.ssh_key]
+        if shutil.which("kitty"):
+            subprocess.Popen(["kitty", "-e"] + cmd)
+        else:
+            subprocess.run(cmd)
+    else:
+        subprocess.run(["adb", "-s", serial, "shell"])
+
+
+def _companion_exec(cfg, conn, serial, cmd_args):
+    """Run a command on companion device and show output"""
+    if not cmd_args:
+        err("Usage: droid companion exec <command>")
+        return
+    cmd_str = " ".join(cmd_args)
+    if conn.ssh_port and conn.ip:
+        ssh_cmd = ["ssh", f"{conn.ssh_user}@{conn.ip}", "-p", str(conn.ssh_port)]
+        if conn.ssh_key:
+            ssh_cmd += ["-i", conn.ssh_key]
+        ssh_cmd.append(cmd_str)
+        r = subprocess.run(ssh_cmd, capture_output=True, text=True, timeout=30)
+    else:
+        r = subprocess.run(
+            ["adb", "-s", serial, "shell", cmd_str],
+            capture_output=True, text=True, timeout=30
+        )
+    out = (r.stdout + r.stderr).strip()
+    if out:
+        print(out)
+
+
+def _companion_share(cfg, conn, serial, target):
+    """Share resources between PC and companion device"""
+    if target == "clip":
+        # Clipboard sync
+        r = subprocess.run(["adb", "-s", serial, "shell",
+                            "echo $(input keyevent KEYCODE_WAKEUP 2>/dev/null); "
+                            "am broadcast -a clipper.get 2>/dev/null; "
+                            "sleep 0.5; input keyevent KEYCODE_SLEEP 2>/dev/null"],
+                           capture_output=True, text=True, timeout=10)
+        print(r.stdout.strip() or "Clipboard pull not supported via ADB directly.\nUse: droid clip push|pull")
+    elif target == "dir":
+        # Open file manager in mount directory
+        mp = cfg.get("mount_point", "/mnt/phone")
+        if Path(mp).is_mount():
+            subprocess.Popen(["xdg-open", mp])
+        else:
+            err("Phone not mounted. Run: droid mount")
+    elif target == "file":
+        # Send file via KDE Connect or ADB
+        subprocess.run([sys.argv[0], "kdeconnect", "send-file"], timeout=15)
+    else:
+        info("Targets: clip (clipboard), file (send file), dir (open mounted storage)")
+
+
+def _companion_tunnel(cfg, conn, serial, action):
+    """Manage network tunnel through companion device"""
+    subprocess.run([sys.argv[0], "tunnel", action or "toggle"])
+
+
 # ── Core implementations ──────────────────────────────────────────────────────
 
 def _run_kvm(cfg: dict):
@@ -2938,7 +3122,7 @@ def cmd_dashboard(args):
 def make_parser():
     p = argparse.ArgumentParser(
         prog="droid",
-        description=f"Unified Android device management tool v{VERSION}",
+        description=f"Unified companion device interface v{VERSION}",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
@@ -3143,6 +3327,20 @@ Examples:
 
     # init
     sub.add_parser("init", help="Probe connection and check dependencies")
+
+    # companion
+    comp = sub.add_parser("companion", help="Unified companion device interface",
+                          aliases=["co"])
+    comp.add_argument("companion_action", nargs="?",
+                      choices=["status", "shell", "exec", "share", "tunnel"],
+                      default="status", help="Action")
+    comp.add_argument("cmd", nargs="*", help="Command for exec action")
+    comp.add_argument("--share", dest="share_target",
+                      choices=["clip", "file", "dir"], default="clip",
+                      help="What to share")
+    comp.add_argument("--tunnel", dest="tunnel_action",
+                      choices=["on", "off", "toggle", "status"], default="toggle",
+                      help="Tunnel action")
 
     return p
 
@@ -3351,21 +3549,23 @@ def cmd_default(args):
                     cursor = len(items)
 
         menu_tree = [
-            {"label": "Device Actions", "items": [
-                {"label": "SSH", "action": lambda: _run(["ssh"], True)},
-                {"label": "Shell", "action": lambda: _run(["shell"], True)},
-                {"label": "Mount", "items": [
-                    {"label": "Mount phone", "action": lambda: _run(["mount", "mount"], True)},
+            {"label": "Link", "items": [
+                {"label": "SSH into device", "action": lambda: _run(["ssh"], True)},
+                {"label": "Shell on device", "action": lambda: _run(["shell"], True)},
+                {"label": "Mount device storage", "items": [
+                    {"label": "Mount", "action": lambda: _run(["mount", "mount"], True)},
                     {"label": "Unmount", "action": lambda: _run(["mount", "unmount"], True)},
                 ]},
-                {"label": "Mirror (scrcpy)", "items": [
+            ]},
+            {"label": "Mirror", "items": [
+                {"label": "Mirror screen (scrcpy)", "items": [
                     {"label": "Normal (4M)", "action": lambda: _run(["mirror"], True)},
                     {"label": "DeX quality (8M)", "action": lambda: _run(["mirror", "--bitrate", "8M"], True)},
                     {"label": "Full quality (12M)", "action": lambda: _run(["mirror", "--bitrate", "12M"], True)},
                     {"label": "Workspace 2", "action": lambda: _run(["mirror", "--workspace", "2"], True)},
                     {"label": "Workspace 3", "action": lambda: _run(["mirror", "--workspace", "3"], True)},
                 ]},
-                {"label": "DeX", "items": [
+                {"label": "DeX mode", "items": [
                     {"label": "Mirror + pick app", "action": lambda: (
                         subprocess.Popen([sys.argv[0], "mirror", "--bitrate", "8M"], stdout=NULL, stderr=NULL),
                         _run(["launch"], False),
@@ -3375,52 +3575,53 @@ def cmd_default(args):
                         _run(["launch", "--pkg"], False),
                     )},
                 ]},
-                {"label": "Info", "action": lambda: _run(["info"], False)},
-                {"label": "Screenshot", "action": lambda: _run(["screenshot"], False)},
-                {"label": "Record", "items": [
-                    {"label": "Record 30s", "action": lambda: _run(["record", "--time", "30"], True)},
-                    {"label": "Record 60s", "action": lambda: _run(["record", "--time", "60"], True)},
-                    {"label": "Record (manual stop)", "action": lambda: _run(["record"], True)},
-                ]},
-                {"label": "Wake/Sleep", "items": [
-                    {"label": "Wake → Sleep cycle", "action": lambda: (
-                        subprocess.run([sys.argv[0], "wake"]), _console.print("[dim]Woken, sleeping in 2s...[/]"),
-                        subprocess.run(["sleep", "2"]), subprocess.run([sys.argv[0], "sleep"]), _getch(),
-                    )},
-                    {"label": "Just wake", "action": lambda: (subprocess.run([sys.argv[0], "wake"]), _getch())},
-                    {"label": "Just sleep", "action": lambda: (subprocess.run([sys.argv[0], "sleep"]), _getch())},
-                ]},
-                {"label": "Home", "action": lambda: _run(["home"], False)},
-                {"label": "Reboot", "items": [
-                    {"label": "Normal reboot", "action": lambda: _run(["reboot"], True)},
-                    {"label": "Recovery mode", "action": lambda: _run(["reboot", "recovery"], True)},
-                    {"label": "Bootloader", "action": lambda: _run(["reboot", "bootloader"], True)},
-                ]},
-            ]},
-            {"label": "Apps & Modules", "items": [
-                {"label": "App list", "action": lambda: _run(["app", "list"], False)},
-                {"label": "Search & install", "action": lambda: _run(["app", "install"], True)},
-                {"label": "Uninstall app", "action": lambda: _run(["app", "uninstall"], True)},
-                {"label": "Install local APK", "action": lambda: _run(["app", "local"], True)},
-                {"label": "Modules", "items": [
-                    {"label": "List modules", "action": lambda: _run(["modules", "list"], False)},
-                    {"label": "Remove module", "action": lambda: _run(["modules", "remove"], True)},
-                    {"label": "Flash module", "action": lambda: _run(["modules", "flash"], True)},
-                ]},
-                {"label": "Debloat", "items": [
-                    {"label": "Default profile", "action": lambda: _run(["debloat"], True)},
-                    {"label": "Samsung profile", "action": lambda: _run(["debloat", "--profile", "samsung"], True)},
-                    {"label": "List profiles", "action": lambda: _run(["debloat", "--list-profiles"], False)},
-                    {"label": "List packages", "action": lambda: _run(["debloat", "--list-packages"], False)},
-                ]},
                 {"label": "Launch app", "items": [
                     {"label": "Pick app (fuzzel)", "action": lambda: _run(["launch"], True)},
                     {"label": "By package name", "action": lambda: _run(["launch", "--pkg"], True)},
                     {"label": "Portrait mode", "action": lambda: _run(["launch", "--portrait"], True)},
                 ]},
+                {"label": "Screenshot", "action": lambda: _run(["screenshot"], False)},
+                {"label": "Record screen", "items": [
+                    {"label": "Record 30s", "action": lambda: _run(["record", "--time", "30"], True)},
+                    {"label": "Record 60s", "action": lambda: _run(["record", "--time", "60"], True)},
+                    {"label": "Record (manual stop)", "action": lambda: _run(["record"], True)},
+                ]},
+            ]},
+            {"label": "Offload", "items": [
+                {"label": "Run command (exec)", "action": lambda: _run(["companion", "exec"], True)},
+                {"label": "App list", "action": lambda: _run(["app", "list"], False)},
+                {"label": "Search & install app", "action": lambda: _run(["app", "install"], True)},
+                {"label": "Uninstall app", "action": lambda: _run(["app", "uninstall"], True)},
+                {"label": "Install local APK", "action": lambda: _run(["app", "local"], True)},
+                {"label": "Debloat device", "items": [
+                    {"label": "Default profile", "action": lambda: _run(["debloat"], True)},
+                    {"label": "Samsung profile", "action": lambda: _run(["debloat", "--profile", "samsung"], True)},
+                    {"label": "List profiles", "action": lambda: _run(["debloat", "--list-profiles"], False)},
+                    {"label": "List packages", "action": lambda: _run(["debloat", "--list-packages"], False)},
+                ]},
+                {"label": "Modules (Magisk/KSU)", "items": [
+                    {"label": "List modules", "action": lambda: _run(["modules", "list"], False)},
+                    {"label": "Remove module", "action": lambda: _run(["modules", "remove"], True)},
+                    {"label": "Flash module", "action": lambda: _run(["modules", "flash"], True)},
+                ]},
+            ]},
+            {"label": "Control", "items": [
+                {"label": "Wake", "action": lambda: (subprocess.run([sys.argv[0], "wake"]), _getch())},
+                {"label": "Sleep", "action": lambda: (subprocess.run([sys.argv[0], "sleep"]), _getch())},
+                {"label": "Wake → Sleep cycle", "action": lambda: (
+                    subprocess.run([sys.argv[0], "wake"]), _console.print("[dim]Woken, sleeping in 2s...[/]"),
+                    subprocess.run(["sleep", "2"]), subprocess.run([sys.argv[0], "sleep"]), _getch(),
+                )},
+                {"label": "Home button", "action": lambda: _run(["home"], False)},
+                {"label": "Reboot", "items": [
+                    {"label": "Normal reboot", "action": lambda: _run(["reboot"], True)},
+                    {"label": "Recovery mode", "action": lambda: _run(["reboot", "recovery"], True)},
+                    {"label": "Bootloader", "action": lambda: _run(["reboot", "bootloader"], True)},
+                ]},
+                {"label": "Info", "action": lambda: _run(["info"], False)},
             ]},
             {"label": "Network", "items": [
-                {"label": "Tunnel", "items": [
+                {"label": "Tunnel (offload routing)", "items": [
                     {"label": "Toggle", "action": lambda: _run(["tunnel", "toggle"], False)},
                     {"label": "Start", "action": lambda: _run(["tunnel", "on"], False)},
                     {"label": "Stop", "action": lambda: _run(["tunnel", "off"], False)},
@@ -3430,7 +3631,7 @@ def cmd_default(args):
                     {"label": "Start", "action": lambda: _run(["wiki"], False)},
                     {"label": "Stop", "action": lambda: _run(["wiki", "--stop"], False)},
                 ]},
-                {"label": "Music/YT", "items": [
+                {"label": "Music/YT download", "items": [
                     {"label": "Download audio", "action": lambda: _run(["music", "--mode", "1"], True)},
                     {"label": "Download video", "action": lambda: _run(["music", "--mode", "2"], True)},
                 ]},
@@ -3445,24 +3646,25 @@ def cmd_default(args):
                     {"label": "List files", "action": lambda: _run(["kdeconnect", "list-files"], True)},
                 ]},
             ]},
+            {"label": "Container", "items": [
+                {"label": "Connect (DroidSpaces)", "action": lambda: _run(["droidconnect"], True)},
+                {"label": "With X11 bridge", "action": lambda: _run(["droidconnect", "--x11"], True)},
+            ]},
             {"label": "System", "items": [
                 {"label": "Device info", "action": lambda: _run(["device"], False)},
                 {"label": "Host info", "action": lambda: _run(["host"], False)},
-                {"label": "List ADB devices", "action": lambda: _run(["devices"], False)},
+                {"label": "Companion status", "action": lambda: _run(["companion"], False)},
+                {"label": "List devices", "action": lambda: _run(["devices"], False)},
                 {"label": "Switch device", "action": lambda: _run(["switch"], True)},
-                {"label": "DroidConnect", "items": [
-                    {"label": "Connect", "action": lambda: _run(["droidconnect"], True)},
-                    {"label": "With X11 bridge", "action": lambda: _run(["droidconnect", "--x11"], True)},
-                ]},
                 {"label": "Clipboard", "items": [
-                    {"label": "Pull from phone", "action": lambda: _run(["clip", "pull"], False)},
-                    {"label": "Push to phone", "action": lambda: _run(["clip", "push"], False)},
+                    {"label": "Pull from device", "action": lambda: _run(["clip", "pull"], False)},
+                    {"label": "Push to device", "action": lambda: _run(["clip", "push"], False)},
                 ]},
             ]},
-            {"label": "Help", "items": [
+            {"label": "About", "items": [
                 {"label": "About droid", "action": lambda: (
                     _console.print(Panel(
-                        f"droid v{VERSION}\nUnified Android device management\n\n"
+                        f"droid v{VERSION}\nUnified companion device management\n\n"
                         f"↑↓/jk navigate   Enter select   Esc/q back",
                         title="About", border_style="cyan"
                     )), _getch()
@@ -3562,6 +3764,8 @@ def main():
         "dash": cmd_dashboard,
         "config": cmd_config,
         "init": cmd_init,
+        "companion": cmd_companion,
+        "co": cmd_companion,
     }
 
     handler = handlers.get(args.command)
