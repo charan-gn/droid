@@ -1,0 +1,34 @@
+#!/bin/bash
+
+PHONE_PORT=8022
+PHONE_USER=charan
+PHONE_HOME=/data/data/com.termux/files/home
+MOUNT_POINT=/mnt/phone
+STORAGE_MOUNT=/mnt/phone-storage
+SSH_KEY=/home/charan/.ssh/id_ed25519
+
+PHONE_IP=$(ip route | grep 'dev eno1' | awk '{print $3}' | head -n 1 | tr -d '[:space:]')
+[ -z "$PHONE_IP" ] && PHONE_IP=$(ip neighbor show dev eno1 | awk '{print $1}' | head -n 1 | tr -d '[:space:]')
+[ -z "$PHONE_IP" ] && { notify-send "Phone not found" "Is ethernet connected?"; exit 1; }
+
+sed -i "s/HostName .*/HostName $PHONE_IP/" ~/.ssh/config
+
+if mountpoint -q "$MOUNT_POINT"; then
+    fusermount3 -u "$MOUNT_POINT"
+    mountpoint -q "$STORAGE_MOUNT" && fusermount3 -u "$STORAGE_MOUNT"
+    notify-send "Phone unmounted"
+else
+    mkdir -p "$MOUNT_POINT" "$STORAGE_MOUNT"
+    sshfs -p "$PHONE_PORT" "$PHONE_USER@$PHONE_IP:$PHONE_HOME" "$MOUNT_POINT" \
+        -o IdentityFile="$SSH_KEY" \
+        -o StrictHostKeyChecking=no \
+        -o reconnect \
+        -o ServerAliveInterval=15
+    sshfs -p "$PHONE_PORT" "$PHONE_USER@$PHONE_IP:/storage/emulated/0" "$STORAGE_MOUNT" \
+        -o IdentityFile="$SSH_KEY" \
+        -o StrictHostKeyChecking=no \
+        -o reconnect \
+        -o ServerAliveInterval=15
+    notify-send "Phone mounted" "$PHONE_IP"
+    nautilus "$STORAGE_MOUNT" &
+fi

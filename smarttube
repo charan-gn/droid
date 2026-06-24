@@ -1,0 +1,25 @@
+#!/bin/bash
+PHONE_IP=$(ip -4 route show dev eno1 | awk '/^default/ {print $3}' | head -n 1)
+[ -z "$PHONE_IP" ] && PHONE_IP=$(ip -4 neighbor show dev eno1 | awk '{print $1}' | grep -v 'FAILED' | head -n 1)
+[ -z "$PHONE_IP" ] && { notify-send -u critical "SmartTube" "Phone IP not found."; exit 1; }
+
+ADB="adb -s $PHONE_IP:5555"
+adb connect "$PHONE_IP:5555" >/dev/null 2>&1
+
+DISP_ID=$($ADB shell dumpsys display \
+    | grep -A2 "mDisplayId" \
+    | grep -v "mDisplayId=0" \
+    | grep -o "mDisplayId=[0-9]*" \
+    | head -1 \
+    | cut -d= -f2)
+[ -z "$DISP_ID" ] && DISP_ID=1
+
+notify-send -u low "SmartTube" "Launching on monitor..."
+
+$ADB shell am start \
+    --display "$DISP_ID" \
+    -a android.intent.action.MAIN \
+    -c android.intent.category.LAUNCHER \
+    -f 0x10200000 \
+    -p org.smarttube.stable \
+    >/dev/null 2>&1

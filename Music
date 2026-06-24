@@ -1,0 +1,108 @@
+#!/bin/bash
+
+BASE_DIR="$HOME/Music"
+STATE_DIR="$HOME/.music_last_dir"
+STATE_MODE="$HOME/.music_last_mode"
+mkdir -p "$BASE_DIR"
+
+if [ -f "$STATE_DIR" ]; then
+    DEFAULT_DIR=$(cat "$STATE_DIR")
+    [ ! -d "$BASE_DIR/$DEFAULT_DIR" ] && DEFAULT_DIR=""
+fi
+
+DEFAULT_MODE=1
+[ -f "$STATE_MODE" ] && DEFAULT_MODE=$(cat "$STATE_MODE")
+
+cd "$BASE_DIR" || exit 1
+subdirs=()
+
+while IFS= read -r -d '' dir; do
+    clean_dir="${dir#./}"
+    [ -n "$clean_dir" ] && subdirs+=("$clean_dir")
+done < <(find . -maxdepth 1 -type d ! -path . -print0 2>/dev/null | sort -z)
+
+echo "Select target folder inside $BASE_DIR:"
+echo "----------------------------------------"
+echo "  [0]  <Create a new folder>"
+
+default_index=""
+for i in "${!subdirs[@]}"; do
+    index=$((i + 1))
+    if [ -n "$DEFAULT_DIR" ] && [ "${subdirs[$i]}" = "$DEFAULT_DIR" ]; then
+        default_index=$index
+        echo "  [$index]* ${subdirs[$i]} (Current Default)"
+    else
+        echo "  [$index]  ${subdirs[$i]}"
+    fi
+done
+echo "----------------------------------------"
+
+if [ -n "$DEFAULT_DIR" ] && [ -n "$default_index" ]; then
+    read -p "Choose option [Default: $default_index ($DEFAULT_DIR)]: " choice
+    [ -z "$choice" ] && choice=$default_index
+else
+    read -p "Choose option [Default: 0 (<Create a new folder>)]: " choice
+    [ -z "$choice" ] && choice=0
+fi
+
+SELECTED_DIR=""
+if [ "$choice" -eq 0 ] 2>/dev/null; then
+    read -p "Enter name for the new folder: " new_folder_name
+    if [ -z "$new_folder_name" ]; then
+        echo "Error: Folder name cannot be empty." >&2
+        exit 1
+    fi
+    mkdir -p "$new_folder_name"
+    SELECTED_DIR="$new_folder_name"
+else
+    array_idx=$((choice - 1))
+    if [ $array_idx -ge 0 ] && [ $array_idx -lt ${#subdirs[@]} ]; then
+        SELECTED_DIR="${subdirs[$array_idx]}"
+    else
+        echo "Error: Invalid selection." >&2
+        exit 1
+    fi
+fi
+
+echo "$SELECTED_DIR" > "$STATE_DIR"
+cd "$SELECTED_DIR" || exit 1
+echo "Target location: $BASE_DIR/$SELECTED_DIR"
+echo ""
+
+read -p "Enter YouTube URL: " url
+if [ -z "$url" ]; then
+    echo "Error: Missing URL." >&2
+    exit 1
+fi
+
+echo ""
+mode_label="Audio"
+[ "$DEFAULT_MODE" = "2" ] && mode_label="Video"
+echo "Download mode:"
+echo "  [1]  Audio only (opus)"
+echo "  [2]  Audio + Video (1080p60)"
+read -p "Choose option [Default: $DEFAULT_MODE ($mode_label)]: " mode
+[ -z "$mode" ] && mode=$DEFAULT_MODE
+printf '%s' "$mode" > "$STATE_MODE"
+
+if [ "$mode" = "1" ]; then
+    echo "Downloading audio..."
+    yt-dlp -f "ba" -x --audio-format opus \
+        --embed-thumbnail --embed-metadata \
+        --write-subs --write-auto-subs \
+        --convert-subs lrc \
+        --postprocessor-args "ExtractAudio:-metadata date= -metadata release_date= -metadata comment=" \
+        -o "%(title)s.%(ext)s" \
+        "$url"
+    echo "Done."
+    kew "$BASE_DIR/$SELECTED_DIR"
+else
+    echo "Downloading 1080p60 video..."
+    yt-dlp -f "bestvideo[height<=1080][fps<=60]+bestaudio" \
+        --merge-output-format mkv \
+        --embed-thumbnail --embed-metadata \
+        --write-subs --write-auto-subs \
+        -o "%(title)s.%(ext)s" \
+        "$url"
+    echo "Done."
+fi

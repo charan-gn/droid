@@ -1,0 +1,17 @@
+#!/bin/bash
+PID_FILE="/tmp/dpi-tunnel.pid"
+
+if [ -f "$PID_FILE" ] && kill -0 $(cat "$PID_FILE") 2>/dev/null; then
+    kill $(cat "$PID_FILE") && rm "$PID_FILE"
+    notify-send -u low "DPI Tunnel" "Disconnected."
+else
+    PHONE_IP=$(ip -4 route show dev eno1 | awk '/^default/ {print $3}' | head -n 1)
+    [ -z "$PHONE_IP" ] && PHONE_IP=$(ip -4 neighbor show dev eno1 | awk '{print $1}' | grep -v 'FAILED' | head -n 1)
+    [ -z "$PHONE_IP" ] && { notify-send -u critical "DPI Tunnel" "Phone IP not found."; exit 1; }
+    ssh -D 1080 -q -N \
+        -o StrictHostKeyChecking=no \
+        -o UserKnownHostsFile=/dev/null \
+        -p 2222 charan@$PHONE_IP &
+    echo $! > "$PID_FILE"
+    notify-send -u low "DPI Tunnel" "Connected via $PHONE_IP."
+fi

@@ -1,0 +1,3575 @@
+#!/usr/bin/env python3
+"""
+droid — Unified Android device management tool
+Integrates: KVM, app mgmt, debloat, mirror, display, SSHFS, DPI tunnel, Kiwix, music download, and more.
+Device-agnostic: auto-detects ADB/SSH targets, no hardcoded serials or interfaces.
+"""
+
+import argparse
+import json
+import os
+import shutil
+import signal
+import socket
+import shlex
+import re
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+from dataclasses import dataclass, field
+from datetime import datetime
+from pathlib import Path
+from typing import Optional, List, Tuple, Set
+
+try:
+    from rich.console import Console
+    from rich.table import Table
+    from rich.panel import Panel
+    from rich.columns import Columns
+    from rich import box as rich_box
+    RICH = True
+except ImportError:
+    RICH = False
+
+VERSION = "1.0.0"
+
+# ── Config ───────────────────────────────────────────────────────────────────
+CONFIG_DIR = Path.home() / ".config" / "droid"
+CONFIG_FILE = CONFIG_DIR / "config.json"
+
+DEFAULT_CONFIG = {
+    # ── Auto-detected on first use; override to pin ──
+    "ssh_interface": "",        # empty = scan all wired ifaces
+    "ssh_port":      0,         # 0 = probe 8022 then 2222
+    "ssh_user":      "",        # empty = detect via adb or skip
+    "ssh_key":       "",        # empty = scan ~/.ssh/
+    "droid_container": "",      # empty = auto-detect first DroidSpaces container
+    # ── ADB ──
+    "adb_connect_auto": True,
+    "adb_connect_string": "",
+    "preferred_device": "",       # empty = auto-pick or fzf prompt
+    # ── Paths ──
+    "mount_point":   "/mnt/phone",
+    "storage_mount": "/mnt/phone-storage",
+    "apk_dir":       str(Path.home() / "apkget" / "apks"),
+    "modules_dir":   str(Path.home() / "apkget" / "modules"),
+    # ── Tunnel ──
+    "socks_port":    1080,
+    "socks_pid_file":"/tmp/droid-tunnel.pid",
+    # ── Kiwix ──
+    "kiwix_zim_dir": str(Path.home() / "Kiwix"),
+    "kiwix_port":    8080,
+    # ── Music ──
+    "music_base_dir": str(Path.home() / "Music"),
+    # ── Debloat ──
+    "debloat_profiles": {
+        "generic": {
+            "meta": ["com.facebook.katana", "com.facebook.appmanager",
+                     "com.facebook.system", "com.facebook.services"],
+            "social": ["com.instagram.android", "com.linkedin.android"],
+            "microsoft": [],
+            "google": ["com.google.android.apps.youtube.music",
+                       "com.google.android.videos", "com.spotify.music"],
+            "carrier": [],
+            "other": []
+        },
+        "samsung": {
+            "meta": ["com.facebook.katana", "com.facebook.appmanager",
+                     "com.facebook.system", "com.facebook.services"],
+            "social": ["com.instagram.android", "com.linkedin.android"],
+            "microsoft": ["com.microsoft.office.officehubrow",
+                          "com.microsoft.office.outlook",
+                          "com.microsoft.skydrive",
+                          "com.microsoft.appmanager"],
+            "samsung": ["com.samsung.android.app.spage",
+                        "com.samsung.android.visionintelligence",
+                        "com.samsung.android.intellivoiceservice",
+                        "com.samsung.android.bixbyvision.framework",
+                        "com.samsung.android.samsungpass",
+                        "com.samsung.android.samsungpassautofill",
+                        "com.samsung.android.game.gamehome",
+                        "com.samsung.android.game.gametools",
+                        "com.samsung.android.game.gos",
+                        "com.samsung.android.app.reminder",
+                        "com.samsung.android.forest",
+                        "com.samsung.android.rubin.app",
+                        "com.samsung.android.app.dressroom",
+                        "com.samsung.android.tvplus",
+                        "com.samsung.android.smartswitchassistant",
+                        "com.samsung.android.voc",
+                        "com.samsung.sree",
+                        "com.sec.android.app.kidshome",
+                        "com.samsung.android.kidsinstaller",
+                        "com.sec.android.emergencylauncher",
+                        "com.samsung.android.emergency",
+                        "com.sec.android.app.sbrowser"],
+            "google": ["com.google.android.apps.youtube.music",
+                       "com.google.android.videos", "com.spotify.music"],
+            "carrier": ["com.rsupport.rs.activity.rsupport.aas2"],
+            "other": []
+        }
+    },
+    "default_debloat_profile": "generic"
+}
+
+DETECTED_FIELDS: set = set()  # tracks which keys were auto-detected
+
+# ── Utilities ─────────────────────────────────────────────────────────────────
+RED = "\033[0;31m"
+GREEN = "\033[0;32m"
+YELLOW = "\033[1;33m"
+CYAN = "\033[0;36m"
+BOLD = "\033[1m"
+DIM = "\033[2m"
+RESET = "\033[0m"
+
+NULL = subprocess.DEVNULL
+
+
+def info(msg):    print(f"{CYAN}  \u2192{RESET} {msg}")
+def success(msg): print(f"{GREEN}  \u2713{RESET} {msg}")
+def err(msg):     print(f"{RED}  \u2717{RESET} {msg}", file=sys.stderr)
+def bold(msg):    print(f"{BOLD}{msg}{RESET}")
+
+def notify(title: str, msg: str, urgency: str = "critical"):
+    try:
+        subprocess.Popen(
+            ["notify-send", "-u", urgency, "-a", "droid", title, msg],
+            stdout=NULL, stderr=NULL
+        )
+    except FileNotFoundError:
+        pass
+
+def fatal(msg: str, title: str = "droid"):
+    err(msg)
+    notify(title, msg, "critical")
+    sys.exit(1)
+
+
+def load_config() -> dict:
+    cfg = DEFAULT_CONFIG.copy()
+    if CONFIG_FILE.exists():
+        try:
+            with open(CONFIG_FILE) as f:
+                user_cfg = json.load(f)
+            cfg.update(user_cfg)
+        except (json.JSONDecodeError, OSError):
+            pass
+    return cfg
+
+
+def save_config(cfg: dict):
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    with open(CONFIG_FILE, "w") as f:
+        json.dump(cfg, f, indent=2)
+
+def config_get(key: str, default=None):
+    return load_config().get(key, default)
+
+# ── Device Discovery ──────────────────────────────────────────────────────────
+
+@dataclass
+class PhoneConn:
+    ip: str = ""
+    adb_serial: str = ""
+    ssh_port: int = 8022
+    ssh_user: str = ""
+    ssh_key: Optional[str] = None
+    iface: str = ""
+    adb_ok: bool = False
+    ssh_ok: bool = False
+
+_conn_cache: Optional[PhoneConn] = None
+_conn_cache_ts: float = 0.0
+CONN_CACHE_TTL: float = 30.0
+
+
+def _iter_wired_ifaces():
+    try:
+        r = subprocess.run(["ip", "-4", "addr", "show"],
+                           capture_output=True, text=True, timeout=5)
+        for line in r.stdout.splitlines():
+            m = re.match(r"^\d+:\s+(\S+):", line)
+            if m:
+                iface = m.group(1).split("@")[0]
+                if any(iface.startswith(p) for p in ("usb", "enp", "eth", "wlan")):
+                    yield iface
+    except Exception:
+        pass
+
+
+def _probe_ssh_port(ip: str, ports: List[int] = (8022, 2222)) -> int:
+    for port in ports:
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(1.0)
+            result = s.connect_ex((ip, port))
+            s.close()
+            if result == 0:
+                return port
+        except Exception:
+            pass
+    return ports[0]
+
+
+def detect_ssh_key() -> Optional[str]:
+    ssh_dir = Path.home() / ".ssh"
+    if ssh_dir.exists():
+        for keyfile in sorted(ssh_dir.glob("id_*")):
+            name = keyfile.name
+            if not name.endswith(".pub") and keyfile.is_file() and name != "config":
+                return str(keyfile)
+    return None
+
+
+def _detect_droid_container(serial: str) -> Optional[str]:
+    droid_paths = [
+        "/data/local/Droidspaces/bin/droidspaces",
+        "/data/data/com.termux/files/usr/bin/droidspaces",
+    ]
+    droid_path = None
+    for p in droid_paths:
+        r = subprocess.run(["adb", "-s", serial, "shell", "test", "-f", p],
+                           capture_output=True, timeout=5)
+        if r.returncode == 0:
+            droid_path = p
+            break
+    if droid_path:
+        r = subprocess.run(
+            ["adb", "-s", serial, "shell", f"{droid_path} list"],
+            capture_output=True, text=True, timeout=10
+        )
+        containers = [l.strip() for l in r.stdout.splitlines() if l.strip()]
+        if containers:
+            return containers[0]
+    for rootfs_dir in [
+        "/data/local/Droidspaces/installed-rootfs/",
+        "/data/local/Droidspaces/containers/",
+        "/data/user/0/app.phonereality.droidspaces/files/rootfs/",
+    ]:
+        r = subprocess.run(
+            ["adb", "-s", serial, "shell", f"ls {rootfs_dir} 2>/dev/null"],
+            capture_output=True, text=True, timeout=5
+        )
+        names = [l.strip() for l in r.stdout.splitlines() if l.strip()]
+        if names:
+            return names[0]
+    return None
+
+
+def _detect_droid_mode(serial: str) -> str:
+    r = subprocess.run(
+        ["adb", "-s", serial, "shell", "su -c id 2>/dev/null || echo no-root"],
+        capture_output=True, text=True, timeout=5
+    )
+    if "uid=0" in r.stdout:
+        return "chroot"
+    return "proot"
+
+
+def _get_all_adb_serials() -> List[str]:
+    try:
+        r = subprocess.run(["adb", "devices"], capture_output=True, text=True, timeout=5)
+        serials = []
+        for line in r.stdout.strip().splitlines()[1:]:
+            if not line.strip():
+                continue
+            parts = line.split()
+            if len(parts) >= 2 and parts[1] == "device":
+                serials.append(parts[0])
+        return serials
+    except Exception:
+        return []
+
+
+def _pick_adb_device(cfg: dict) -> Optional[str]:
+    preferred = cfg.get("preferred_device") or ""
+    serials = _get_all_adb_serials()
+    if not serials:
+        return None
+    if preferred and preferred in serials:
+        return preferred
+    if len(serials) == 1:
+        return serials[0]
+    chosen = _fzf_pick(serials, "Select ADB device")
+    return chosen or serials[0]
+
+
+def resolve_connection(cfg: dict, preferred_serial: str = "") -> PhoneConn:
+    global _conn_cache, _conn_cache_ts
+    now = time.monotonic()
+    if _conn_cache and now - _conn_cache_ts < CONN_CACHE_TTL:
+        return _conn_cache
+
+    conn = PhoneConn()
+
+    # ADB serial — multi-device aware
+    if cfg.get("adb_connect_string"):
+        subprocess.run(["adb", "connect", cfg["adb_connect_string"]],
+                       capture_output=True, timeout=5)
+    serial = preferred_serial or cfg.get("preferred_device") or ""
+    if serial:
+        conn.adb_serial = serial
+        conn.adb_ok = True
+    else:
+        all_serials = _get_all_adb_serials()
+        if len(all_serials) == 1:
+            conn.adb_serial = all_serials[0]
+            conn.adb_ok = True
+        elif len(all_serials) > 1:
+            chosen = _fzf_pick(all_serials, "Select ADB device")
+            if chosen:
+                conn.adb_serial = chosen
+                conn.adb_ok = True
+
+    # Auto-connect ADB via IP if no serial
+    if not conn.adb_serial and cfg.get("adb_connect_auto", True):
+        iface = cfg.get("ssh_interface", "")
+        for iface_candidate in [iface] if iface else _iter_wired_ifaces():
+            try:
+                r = subprocess.run(
+                    ["ip", "-4", "neighbor", "show", "dev", iface_candidate],
+                    capture_output=True, text=True, timeout=5
+                )
+                for line in r.stdout.splitlines():
+                    parts = line.split()
+                    if parts and parts[0] and "FAILED" not in line and "REACHABLE" in line:
+                        ip = parts[0]
+                        subprocess.run(["adb", "connect", f"{ip}:5555"],
+                                       capture_output=True, timeout=5)
+                        conn.iface = iface_candidate
+                        break
+                conn.iface = iface_candidate
+                r2 = subprocess.run(["adb", "devices"], capture_output=True, text=True, timeout=3)
+                for line2 in r2.stdout.strip().splitlines()[1:]:
+                    if line2.strip() and "device" in line2:
+                        conn.adb_serial = line2.split()[0]
+                        conn.adb_ok = True
+                        break
+            except Exception:
+                pass
+            if conn.adb_ok:
+                break
+
+    # IP detection
+    iface = cfg.get("ssh_interface", "")
+    for iface_candidate in [iface] if iface else _iter_wired_ifaces():
+        try:
+            r = subprocess.run(
+                ["ip", "-4", "neighbor", "show", "dev", iface_candidate],
+                capture_output=True, text=True, timeout=5
+            )
+            for line in r.stdout.splitlines():
+                parts = line.split()
+                if parts and parts[0] and "FAILED" not in line and "REACHABLE" in line:
+                    conn.ip = parts[0]
+                    conn.iface = iface_candidate
+                    break
+        except Exception:
+            pass
+        if conn.ip:
+            break
+    if not conn.ip and iface:
+        try:
+            r = subprocess.run(
+                ["ip", "-4", "route", "show", "dev", iface],
+                capture_output=True, text=True, timeout=5
+            )
+            for line in r.stdout.splitlines():
+                parts = line.split()
+                if len(parts) > 2 and parts[0] == "default":
+                    conn.ip = parts[2]
+                    conn.iface = iface
+        except Exception:
+            pass
+
+    # SSH port
+    cfg_port = cfg.get("ssh_port") or 0
+    if cfg_port:
+        conn.ssh_port = cfg_port
+    elif conn.ip:
+        conn.ssh_port = _probe_ssh_port(conn.ip)
+
+    # SSH user
+    cfg_user = cfg.get("ssh_user") or ""
+    if cfg_user:
+        conn.ssh_user = cfg_user
+    elif conn.adb_ok:
+        try:
+            r = subprocess.run(
+                ["adb", "-s", conn.adb_serial.replace(" (unauthorized)", ""),
+                 "shell", "id", "-un"],
+                capture_output=True, text=True, timeout=5
+            )
+            conn.ssh_user = r.stdout.strip()
+        except Exception:
+            pass
+
+    # SSH key
+    cfg_key = cfg.get("ssh_key") or ""
+    if cfg_key:
+        conn.ssh_key = cfg_key
+    else:
+        conn.ssh_key = detect_ssh_key()
+
+    # SSH connectivity probe
+    if conn.ip and conn.ssh_user:
+        try:
+            r = subprocess.run(
+                ["ssh", "-q", "-o", "ConnectTimeout=2",
+                 "-o", "StrictHostKeyChecking=no",
+                 "-p", str(conn.ssh_port),
+                 "-o", "BatchMode=yes",
+                 f"{conn.ssh_user}@{conn.ip}", "true"],
+                capture_output=True, timeout=5
+            )
+            conn.ssh_ok = (r.returncode == 0)
+        except Exception:
+            conn.ssh_ok = False
+
+    _conn_cache = conn
+    _conn_cache_ts = now
+    return conn
+
+
+def get_adb_serial(cfg: dict) -> Optional[str]:
+    conn = resolve_connection(cfg)
+    return conn.adb_serial if conn.adb_ok else None
+
+
+def require_adb(cfg: dict) -> str:
+    conn = resolve_connection(cfg)
+    if not conn.adb_ok:
+        fatal("No ADB device connected.\nConnect via USB or enable wireless ADB.")
+    return conn.adb_serial
+
+
+def _get_host_info() -> dict:
+    info = {}
+    try:
+        r = subprocess.run(["hostname"], capture_output=True, text=True, timeout=3)
+        info["hostname"] = r.stdout.strip()
+    except:
+        info["hostname"] = "?"
+    try:
+        r = subprocess.run(["uname", "-r"], capture_output=True, text=True, timeout=3)
+        info["kernel"] = r.stdout.strip()
+    except:
+        info["kernel"] = "?"
+    try:
+        r = subprocess.run(["uname", "-m"], capture_output=True, text=True, timeout=3)
+        info["arch"] = r.stdout.strip()
+    except:
+        info["arch"] = "?"
+    try:
+        with open("/etc/os-release") as f:
+            for line in f:
+                if line.startswith("PRETTY_NAME="):
+                    info["os"] = line.split("=", 1)[1].strip().strip('"')
+                    break
+        if "os" not in info:
+            info["os"] = "Linux"
+    except:
+        info["os"] = "Linux"
+    try:
+        r = subprocess.run(["uptime", "-p"], capture_output=True, text=True, timeout=3)
+        info["uptime"] = r.stdout.strip().replace("up ", "")
+    except:
+        info["uptime"] = "?"
+    try:
+        r = subprocess.run(["nproc"], capture_output=True, text=True, timeout=3)
+        info["cpu"] = f"{r.stdout.strip()} cores"
+    except:
+        info["cpu"] = "?"
+    desk = os.environ.get("XDG_SESSION_DESKTOP") or os.environ.get("DESKTOP_SESSION") or ""
+    info["desktop"] = desk
+    try:
+        r = subprocess.run(["free", "-h"], capture_output=True, text=True, timeout=3)
+        for line in r.stdout.splitlines():
+            if line.startswith("Mem:"):
+                parts = line.split()
+                info["mem"] = f"{parts[2]} / {parts[1]}"
+                break
+    except:
+        info["mem"] = "?"
+    return info
+
+
+def require_ssh_ip(cfg: dict) -> str:
+    conn = resolve_connection(cfg)
+    if not conn.ip:
+        fatal("Could not detect phone IP.\nIs USB tethering or ethernet connected?")
+    return conn.ip
+
+
+def check_dep(cmd: str, hint: str = ""):
+    if not shutil.which(cmd):
+        msg = f"Required tool not found: {cmd}"
+        if hint:
+            msg += f"\nInstall: {hint}"
+        fatal(msg)
+
+
+# ── Interactive picker ─────────────────────────────────────────────────────────
+
+def _fzf_pick(items: List[str], prompt: str = "Select") -> Optional[str]:
+    if not items:
+        return None
+    if shutil.which("fzf"):
+        input_data = "\n".join(items)
+        r = subprocess.run(
+            ["fzf", "--prompt", f"{prompt}: ", "--height=40%", "--border"],
+            input=input_data, capture_output=True, text=True
+        )
+        return r.stdout.strip() or None
+    print(f"\n{prompt}:")
+    for i, item in enumerate(items, 1):
+        print(f"  [{i}]  {item}")
+    choice = _pick_number(len(items))
+    return items[choice - 1] if choice else None
+
+
+# ── Subcommands ───────────────────────────────────────────────────────────────
+
+def cmd_device(args):
+    """Show detected device info"""
+    cfg = load_config()
+    conn = resolve_connection(cfg)
+    if RICH:
+        _console = Console()
+        t = Table(box=rich_box.SIMPLE, show_header=False)
+        t.add_column(style="cyan", width=20)
+        t.add_column(style="white")
+        t.add_row("🔌  ADB", f"{'on' if conn.adb_ok else 'off'}  {conn.adb_serial or ''}" if conn.adb_ok else "off")
+        t.add_row("🖥️  SSH", f"{'on' if conn.ip else 'off'}  {f'{conn.ip} port {conn.ssh_port}' if conn.ip else ''}")
+        t.add_row("📋  Config", str(CONFIG_FILE))
+        _console.print(Panel(t, title="Device Info", border_style="cyan"))
+        return
+    print(f"{BOLD}Device Info:{RESET}")
+    if conn.adb_ok:
+        success(f"ADB: {conn.adb_serial}")
+    else:
+        err("ADB: No device found")
+    if conn.ip:
+        success(f"SSH: {conn.ip} port {conn.ssh_port} user {conn.ssh_user}")
+    else:
+        err("SSH: No device found")
+    print(f"\n{DIM}Config: {CONFIG_FILE}{RESET}")
+
+
+def cmd_host(args):
+    """Show local host info"""
+    info = _get_host_info()
+    if RICH:
+        _console = Console()
+        rows = [
+            ("💻  Hostname", info.get("hostname", "?")),
+            ("🖥️  OS", info.get("os", "?")),
+            ("🐧  Kernel", info.get("kernel", "?")),
+            ("🏗️  Arch", info.get("arch", "?")),
+            ("⏱️  Uptime", info.get("uptime", "?")),
+            ("🧠  CPU", info.get("cpu", "?")),
+            ("💾  Memory", info.get("mem", "?")),
+            ("🪟  Desktop", info.get("desktop", "?") or "none"),
+        ]
+        t = Table(box=rich_box.SIMPLE, show_header=False)
+        t.add_column(style="cyan", width=18)
+        t.add_column(style="white")
+        for k, v in rows:
+            t.add_row(k, v)
+        _console.print(Panel(t, title="Host", border_style="magenta"))
+        return
+    print(f"{BOLD}Host:{RESET}")
+    for k, v in [
+        ("Hostname", info.get("hostname", "?")),
+        ("OS", info.get("os", "?")),
+        ("Kernel", info.get("kernel", "?")),
+        ("Arch", info.get("arch", "?")),
+        ("Uptime", info.get("uptime", "?")),
+        ("CPU", info.get("cpu", "?")),
+        ("Memory", info.get("mem", "?")),
+        ("Desktop", info.get("desktop", "?") or "none"),
+    ]:
+        print(f"  {k+':':12s} {v}")
+
+
+def cmd_devices(args):
+    """List all connected ADB devices"""
+    serials = _get_all_adb_serials()
+    if RICH:
+        _console = Console()
+        if not serials:
+            _console.print(Panel("[red]No ADB devices connected[/]", title="Devices", border_style="red"))
+            return
+        cfg = load_config()
+        preferred = cfg.get("preferred_device", "")
+        if not preferred and len(serials) == 1:
+            preferred = serials[0]
+        rows = []
+        for s in serials:
+            marker = "  ← active" if s == preferred else ""
+            rows.append(("🔌", s, marker))
+        t = Table(box=rich_box.SIMPLE, show_header=False)
+        t.add_column(style="cyan", width=4)
+        t.add_column(style="white")
+        t.add_column(style="green")
+        for icon, serial, marker in rows:
+            t.add_row(icon, serial, marker)
+        _console.print(Panel(t, title=f"ADB Devices ({len(serials)})", border_style="cyan"))
+        return
+    if not serials:
+        err("No ADB devices connected.")
+        return
+    print(f"{BOLD}ADB Devices ({len(serials)}):{RESET}")
+    cfg = load_config()
+    preferred = cfg.get("preferred_device", "")
+    if not preferred and len(serials) == 1:
+        preferred = serials[0]
+    for s in serials:
+        marker = "  ← active" if s == preferred else ""
+        print(f"  🔌  {s}{marker}")
+
+
+def cmd_switch(args):
+    """Switch active ADB device"""
+    global _conn_cache
+    serials = _get_all_adb_serials()
+    if not serials:
+        fatal("No ADB devices connected.")
+    if len(serials) == 1:
+        cfg = load_config()
+        cfg["preferred_device"] = serials[0]
+        DETECTED_FIELDS.discard("preferred_device")
+        save_config(cfg)
+        _conn_cache = None
+        success(f"Active device: {serials[0]}")
+        return
+    chosen = _fzf_pick(serials, "Select ADB device")
+    if chosen:
+        cfg = load_config()
+        cfg["preferred_device"] = chosen
+        DETECTED_FIELDS.discard("preferred_device")
+        save_config(cfg)
+        _conn_cache = None
+        success(f"Active device: {chosen}")
+
+
+def cmd_ssh(args):
+    """SSH into phone"""
+    cfg = load_config()
+    conn = resolve_connection(cfg)
+    if not conn.ip:
+        fatal("Could not detect phone IP.\nIs USB tethering or ethernet connected?")
+    cmd = ["ssh", "-p", str(conn.ssh_port), f"{conn.ssh_user}@{conn.ip}",
+           "-o", "StrictHostKeyChecking=no",
+           "-o", "ServerAliveInterval=15"]
+    if conn.ssh_key:
+        cmd.extend(["-i", conn.ssh_key])
+    r = subprocess.run(cmd)
+    if r.returncode != 0:
+        err(f"SSH exited with code {r.returncode}.")
+        sys.exit(r.returncode)
+
+
+def cmd_shell(args):
+    """Interactive phone shell (SSH preferred, ADB fallback)"""
+    cfg = load_config()
+    conn = resolve_connection(cfg)
+    if conn.ssh_ok:
+        cmd = ["ssh", "-t", "-p", str(conn.ssh_port), f"{conn.ssh_user}@{conn.ip}",
+               "-o", "StrictHostKeyChecking=no"]
+        if conn.ssh_key:
+            cmd.extend(["-i", conn.ssh_key])
+        if args.cmd:
+            cmd.append(args.cmd)
+        subprocess.run(cmd)
+    elif conn.adb_ok:
+        cmd = ["adb", "-s", conn.adb_serial, "shell"]
+        if args.cmd:
+            cmd.append(args.cmd)
+        subprocess.run(cmd)
+    else:
+        fatal("No connection to device.\nConnect USB or enable wireless ADB.")
+
+
+def cmd_status(args):
+    """One-shot status dashboard"""
+    cfg = load_config()
+    from concurrent.futures import ThreadPoolExecutor as TPE
+
+    results = {}
+    def fetch(key, fn):
+        try:
+            results[key] = fn()
+        except Exception as e:
+            results[key] = f"error: {e}"
+
+    def get_battery():
+        r = subprocess.run(["adb", "shell", "dumpsys", "battery"],
+                           capture_output=True, text=True, timeout=5)
+        level = ""
+        charging = ""
+        for line in r.stdout.splitlines():
+            l = line.strip()
+            if l.startswith("level:"):
+                level = l.split()[-1]
+            elif "AC powered" in l:
+                charging = "charging" if "true" in l else ""
+        return f"{level}%{' ' + charging if charging else ''}"
+
+    def get_model():
+        r = subprocess.run(["adb", "shell", "getprop", "ro.product.model"],
+                           capture_output=True, text=True, timeout=5)
+        return r.stdout.strip()
+
+    def get_android():
+        r = subprocess.run(["adb", "shell", "getprop", "ro.build.version.release"],
+                           capture_output=True, text=True, timeout=5)
+        ver = r.stdout.strip()
+        r2 = subprocess.run(["adb", "shell", "getprop", "ro.lineage.version"],
+                            capture_output=True, text=True, timeout=5)
+        los = r2.stdout.strip()
+        return f"Android {ver}" + (f" / LOS {los}" if los else "")
+
+    conn = resolve_connection(cfg)
+    with TPE(max_workers=6) as pool:
+        pool.submit(fetch, "battery", get_battery)
+        pool.submit(fetch, "model", get_model)
+        pool.submit(fetch, "android", get_android)
+
+    tunnel_running = os.path.exists(cfg.get("socks_pid_file", ""))
+    try:
+        r = subprocess.run(["ss", "-tulpn"], capture_output=True, text=True)
+        kiwix_on = f":{cfg.get('kiwix_port', 8080)} " in r.stdout
+    except Exception:
+        kiwix_on = False
+
+    kde_count = "?"
+    if shutil.which("kdeconnect-cli"):
+        try:
+            r = subprocess.run(["kdeconnect-cli", "-l", "--id-only"],
+                               capture_output=True, text=True, timeout=5)
+            kde_list = [l.strip() for l in r.stdout.splitlines() if l.strip()]
+            kde_count = str(len(kde_list))
+        except Exception:
+            pass
+
+    adb_str = f"on {conn.adb_serial}" if conn.adb_ok else "off"
+    ssh_str = f"on port {conn.ssh_port}" if conn.ssh_ok else "off"
+    iface_str = f"{conn.iface}" if conn.ip else f"{conn.iface or '?'}  (no IP)"
+
+    if RICH:
+        _console = Console()
+        dev_rows = [
+            ("📱  Model", results.get("model", "?")),
+            ("🤖  Android", results.get("android", "?")),
+            ("🔋  Battery", results.get("battery", "?")),
+            ("🔌  ADB", adb_str),
+            ("🖥️  SSH", ssh_str),
+            ("📡  KDE Connect", f"{kde_count} device{'s' if kde_count != '1' else ''}"),
+        ]
+        t = Table(box=rich_box.SIMPLE, show_header=False)
+        t.add_column(style="cyan", width=20)
+        t.add_column(style="white")
+        for k, v in dev_rows:
+            t.add_row(k, v)
+        _console.print(Panel(t, title="Device Status", border_style="green"))
+        ds_mode = _detect_droid_mode(conn.adb_serial) if conn.adb_ok else "?"
+        t2 = Table(box=rich_box.SIMPLE, show_header=False)
+        t2.add_column(style="cyan", width=20)
+        t2.add_column(style="white")
+        t2.add_row("📦  Mode", ds_mode)
+        _console.print(Panel(t2, title="DroidSpaces", border_style="blue"))
+        net_rows = [
+            ("🌐  Interface", iface_str),
+            ("🔒  Tunnel", "on" if tunnel_running else "off"),
+            ("📚  Kiwix", "on" if kiwix_on else "off"),
+        ]
+        t3 = Table(box=rich_box.SIMPLE, show_header=False)
+        t3.add_column(style="cyan", width=20)
+        t3.add_column(style="white")
+        for k, v in net_rows:
+            t3.add_row(k, v)
+        _console.print(Panel(t3, title="Network", border_style="yellow"))
+        host = _get_host_info()
+        host_rows = [
+            ("💻  Hostname", host.get("hostname", "?")),
+            ("🖥️  OS", host.get("os", "?")),
+            ("🐧  Kernel", host.get("kernel", "?")),
+            ("⏱️  Uptime", host.get("uptime", "?")),
+        ]
+        t4 = Table(box=rich_box.SIMPLE, show_header=False)
+        t4.add_column(style="magenta", width=18)
+        t4.add_column(style="white")
+        for k, v in host_rows:
+            t4.add_row(k, v)
+        _console.print(Panel(t4, title="Host", border_style="magenta"))
+        return
+
+    print(f"{BOLD}Device{RESET}")
+    print(f"  📱  Model:     {results.get('model', '?')}")
+    print(f"  🤖  Android:   {results.get('android', '?')}")
+    print(f"  🔋  Battery:   {results.get('battery', '?')}")
+    print(f"  🔌  ADB:       {adb_str}")
+    print(f"  🖥️  SSH:       {ssh_str}")
+    print(f"  📡  KDE:       {kde_count} devices")
+    print()
+    print(f"{BOLD}Network{RESET}")
+    print(f"  🌐  Interface: {iface_str}")
+    print(f"  🔒  Tunnel:    {'on' if tunnel_running else 'off'}")
+    print(f"  📚  Kiwix:     {'on' if kiwix_on else 'off'}")
+    host = _get_host_info()
+    print()
+    print(f"{BOLD}Host{RESET}")
+    print(f"  💻  Hostname: {host.get('hostname', '?')}")
+    print(f"  🖥️  OS:       {host.get('os', '?')}")
+    print(f"  🐧  Kernel:  {host.get('kernel', '?')}")
+    print(f"  ⏱️  Uptime:  {host.get('uptime', '?')}")
+
+
+def cmd_screenshot(args):
+    """Take phone screenshot"""
+    cfg = load_config()
+    serial = require_adb(cfg)
+    path = args.path or str(Path.home() / "Pictures" / f"droid-{datetime.now().strftime('%Y%m%d_%H%M%S')}.png")
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "wb") as f:
+        subprocess.run(["adb", "-s", serial, "exec-out", "screencap", "-p"],
+                       stdout=f, stderr=NULL)
+    success(f"Screenshot saved: {path}")
+
+
+def cmd_record(args):
+    """Record phone screen"""
+    cfg = load_config()
+    serial = require_adb(cfg)
+    path = args.path or str(Path.home() / "Videos" / f"droid-{datetime.now().strftime('%Y%m%d_%H%M%S')}.mp4")
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    cmd = ["scrcpy", "-s", serial, "--no-audio", "--record", path]
+    if args.time:
+        cmd.append(f"--time-limit={args.time}")
+    subprocess.run(cmd)
+    success(f"Recording saved: {path}")
+
+
+def cmd_info(args):
+    """Extended device info table"""
+    cfg = load_config()
+    serial = require_adb(cfg)
+    from concurrent.futures import ThreadPoolExecutor as TPE
+
+    def adb_getprop(prop):
+        r = subprocess.run(["adb", "-s", serial, "shell", f"getprop {prop}"],
+                           capture_output=True, text=True, timeout=5)
+        return r.stdout.strip()
+
+    def adb_cmd(cmd):
+        r = subprocess.run(["adb", "-s", serial, "shell", cmd],
+                           capture_output=True, text=True, timeout=5)
+        return r.stdout.strip()
+
+    props = {}
+    def fetch_prop(key, prop):
+        props[key] = adb_getprop(prop)
+
+    def fetch_cmd(key, cmd):
+        props[key] = adb_cmd(cmd)
+
+    with TPE(max_workers=6) as pool:
+        pool.submit(fetch_prop, "model", "ro.product.model")
+        pool.submit(fetch_prop, "brand", "ro.product.brand")
+        pool.submit(fetch_prop, "codename", "ro.product.device")
+        pool.submit(fetch_prop, "android", "ro.build.version.release")
+        pool.submit(fetch_prop, "patch", "ro.build.version.security_patch")
+        pool.submit(fetch_prop, "los", "ro.lineage.version")
+        pool.submit(fetch_prop, "abis", "ro.product.cpu.abilist")
+        pool.submit(fetch_cmd, "kernel", "uname -r")
+        pool.submit(fetch_cmd, "mem", "cat /proc/meminfo | grep MemTotal")
+        pool.submit(fetch_cmd, "storage", "df -h /data | tail -1")
+        pool.submit(fetch_cmd, "display", "wm size")
+
+    mem_raw = props.get("mem", "")
+    if mem_raw:
+        m = re.search(r'(\d+)', mem_raw)
+        ram_gb = f"{int(m.group(1)) / 1024 / 1024:.1f} GiB" if m else mem_raw.strip()
+    else:
+        ram_gb = "?"
+
+    storage_raw = props.get("storage", "")
+    if storage_raw:
+        parts = storage_raw.split()
+        if len(parts) >= 5:
+            storage = f"{parts[1]} total · {parts[2]} used · {parts[3]} free"
+        else:
+            storage = storage_raw
+    else:
+        storage = "?"
+
+    display_raw = props.get("display", "")
+    display = display_raw.replace("Physical size:", "").strip() if display_raw else "?"
+
+    rows = [
+        ("Model", props.get("model", "?")),
+        ("Brand", props.get("brand", "?")),
+        ("Codename", props.get("codename", "?")),
+        ("Android", props.get("android", "?") + (f" / LOS {props['los']}" if props.get("los") else "")),
+        ("Security Patch", props.get("patch", "?")),
+        ("CPU ABIs", props.get("abis", "?")),
+        ("Kernel", props.get("kernel", "?")),
+        ("RAM", ram_gb),
+        ("Storage", storage),
+        ("Display", display),
+    ]
+    if RICH:
+        _console = Console()
+        icons = ["📱", "🏷️", "🔧", "🤖", "🔐", "🧠", "🐧", "💾", "💽", "🖥️"]
+        t = Table(box=rich_box.SIMPLE, show_header=False)
+        t.add_column(style="cyan", width=18)
+        t.add_column(style="white")
+        for (k, v), icon in zip(rows, icons):
+            t.add_row(f"{icon}  {k}", str(v))
+        _console.print(Panel(t, title="Device Info", border_style="cyan"))
+        return
+    print(f"{BOLD}Device Info:{RESET}")
+    for k, v in rows:
+        print(f"  {k+':':18s} {v}")
+
+
+def cmd_clip(args):
+    """Clipboard sync push/pull"""
+    cfg = load_config()
+    serial = require_adb(cfg)
+
+    if args.direction == "push":
+        r = subprocess.run(["wl-paste"], capture_output=True, text=True, timeout=5)
+        text = r.stdout.strip()
+        if not text:
+            err("Clipboard is empty.")
+            return
+        quoted = shlex.quote(text)
+        r2 = subprocess.run(
+            ["adb", "-s", serial, "shell",
+             f"am broadcast -a clipper.set --es text {quoted}"],
+            capture_output=True, timeout=5
+        )
+        if r2.returncode == 0:
+            success(f"Clipboard pushed ({len(text)} chars) via Clipper broadcast.")
+        else:
+            err("Clipboard push failed.")
+    else:
+        try:
+            r = subprocess.run(
+                ["adb", "-s", serial, "shell",
+                 "service call clipboard 2 2>/dev/null | grep -oP '(?<=0x).*?(?=\\s|$)'"],
+                capture_output=True, text=True, timeout=5
+            )
+            if r.stdout.strip() and r.returncode == 0:
+                hex_data = "".join(r.stdout.split())
+                text = bytes.fromhex(hex_data).decode("utf-16le", errors="ignore").strip("\x00")
+                if text:
+                    subprocess.run(["wl-copy"], input=text.encode(), check=True)
+                    success(f"Clipboard pulled ({len(text)} chars) via root method.")
+                    return
+        except Exception:
+            pass
+        r2 = subprocess.run(
+            ["adb", "-s", serial, "shell", "am broadcast -a clipper.get"],
+            capture_output=True, text=True, timeout=5
+        )
+        if "Result: " in r2.stdout:
+            text = r2.stdout.split("Result: ")[-1].strip()
+            subprocess.run(["wl-copy"], input=text.encode(), check=True)
+            success(f"Clipboard pulled ({len(text)} chars) via Clipper broadcast.")
+        else:
+            err("Clipboard pull failed. Install Clipper app or ensure root access.")
+
+
+def cmd_wake(args):
+    """Wake up device screen"""
+    cfg = load_config()
+    serial = require_adb(cfg)
+    subprocess.run(["adb", "-s", serial, "shell", "input", "keyevent", "KEYCODE_WAKEUP"],
+                   stdout=NULL, stderr=NULL)
+    success("Device woken.")
+
+
+def cmd_sleep(args):
+    """Put device to sleep"""
+    cfg = load_config()
+    serial = require_adb(cfg)
+    subprocess.run(["adb", "-s", serial, "shell", "input", "keyevent", "KEYCODE_SLEEP"],
+                   stdout=NULL, stderr=NULL)
+    success("Device asleep.")
+
+
+def cmd_reboot(args):
+    """Reboot device"""
+    cfg = load_config()
+    serial = require_adb(cfg)
+    mode = {"recovery": "recovery", "bootloader": "bootloader"}
+    m = mode.get(args.mode, "")
+    if m == "bootloader":
+        confirm = input("  Reboot to bootloader? [y/N] ").strip().lower()
+        if confirm != "y":
+            info("Cancelled.")
+            return
+    subprocess.run(["adb", "-s", serial, "reboot"] + ([m] if m else []),
+                   stdout=NULL, stderr=NULL)
+    success(f"Rebooting{mode}...")
+
+
+def cmd_forward(args):
+    """Manage ADB port forwarding"""
+    cfg = load_config()
+    serial = require_adb(cfg)
+    if args.action == "list":
+        r = subprocess.run(["adb", "-s", serial, "forward", "--list"],
+                           capture_output=True, text=True)
+        print(r.stdout.strip())
+    elif args.action == "add":
+        subprocess.run(["adb", "-s", serial, "forward", f"tcp:{args.port}", f"tcp:{args.port}"],
+                       stdout=NULL, stderr=NULL)
+        success(f"Forwarding tcp:{args.port} -> tcp:{args.port}")
+    elif args.action == "rm":
+        subprocess.run(["adb", "-s", serial, "forward", "--remove", f"tcp:{args.port}"],
+                       stdout=NULL, stderr=NULL)
+        success(f"Removed tcp:{args.port}")
+    elif args.action == "rm-all":
+        subprocess.run(["adb", "-s", serial, "forward", "--remove-all"],
+                       stdout=NULL, stderr=NULL)
+        success("All forwards removed.")
+
+
+def cmd_mount(args):
+    """Mount/unmount phone via SSHFS"""
+    cfg = load_config()
+    conn = resolve_connection(cfg)
+    ip = conn.ip
+    if not ip:
+        fatal("Could not detect phone IP.\nIs USB tethering or ethernet connected?")
+    mount_point = cfg["mount_point"]
+    storage_mount = cfg["storage_mount"]
+    ssh_port = conn.ssh_port
+    ssh_user = conn.ssh_user
+    ssh_key = conn.ssh_key
+
+    check_dep("sshfs", "sudo pacman -S sshfs")
+    check_dep("fusermount3", "sudo pacman -S fuse3")
+
+    def is_mounted(path):
+        return subprocess.run(["mountpoint", "-q", path], capture_output=True).returncode == 0
+
+    if args.action == "unmount":
+        for mp in [mount_point, storage_mount]:
+            if is_mounted(mp):
+                subprocess.run(["fusermount3", "-u", mp], stdout=NULL, stderr=NULL)
+                info(f"Unmounted {mp}")
+        try:
+            subprocess.run(["notify-send", "Phone", "Unmounted"], stdout=NULL, stderr=NULL)
+        except Exception:
+            pass
+        return
+
+    if is_mounted(mount_point):
+        info("Already mounted.")
+        return
+
+    Path(mount_point).mkdir(parents=True, exist_ok=True)
+    Path(storage_mount).mkdir(parents=True, exist_ok=True)
+
+    ssh_opts = [
+        "-o", "StrictHostKeyChecking=no",
+        "-o", "reconnect",
+        "-o", "ServerAliveInterval=15",
+    ]
+    if ssh_key:
+        ssh_opts = ["-o", f"IdentityFile={ssh_key}"] + ssh_opts
+
+    info(f"Mounting home via SSHFS...")
+    subprocess.run(
+        ["sshfs", "-p", str(ssh_port), f"{ssh_user}@{ip}:/data/data/com.termux/files/home",
+         mount_point] + ssh_opts,
+        stdout=NULL, stderr=NULL
+    )
+
+    info(f"Mounting storage via SSHFS...")
+    subprocess.run(
+        ["sshfs", "-p", str(ssh_port), f"{ssh_user}@{ip}:/storage/emulated/0",
+         storage_mount] + ssh_opts,
+        stdout=NULL, stderr=NULL
+    )
+
+    if is_mounted(mount_point):
+        success(f"Mounted at {mount_point} and {storage_mount}")
+        try:
+            subprocess.run(["notify-send", "Phone mounted", f"{ip}"], stdout=NULL, stderr=NULL)
+        except Exception:
+            pass
+        subprocess.Popen(["xdg-open", storage_mount], stdout=NULL, stderr=NULL)
+    else:
+        err("Mount failed.")
+
+
+def cmd_tunnel(args):
+    """Toggle DPI bypass SOCKS5 tunnel"""
+    cfg = load_config()
+    pid_file = cfg["socks_pid_file"]
+    socks_port = cfg["socks_port"]
+
+    def is_running():
+        if os.path.exists(pid_file):
+            try:
+                with open(pid_file) as f:
+                    pid = int(f.read().strip())
+                os.kill(pid, 0)
+                return True
+            except (ProcessLookupError, ValueError, OSError):
+                pass
+        return False
+
+    if args.action == "status":
+        if is_running():
+            try:
+                with open(pid_file) as f:
+                    pid = f.read().strip()
+                success(f"Tunnel running (PID: {pid}, port {socks_port})")
+            except (FileNotFoundError, ValueError):
+                info("Tunnel status unavailable.")
+        else:
+            info("Tunnel not running.")
+        return
+
+    if args.action == "off" or (args.action == "toggle" and is_running()):
+        if is_running():
+            with open(pid_file) as f:
+                pid = int(f.read().strip())
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            if os.path.exists(pid_file):
+                os.remove(pid_file)
+            info("Tunnel stopped.")
+            try:
+                subprocess.run(["notify-send", "-u", "low", "DPI Tunnel", "Disconnected."],
+                               stdout=NULL, stderr=NULL)
+            except Exception:
+                pass
+        else:
+            info("Not running.")
+        return
+
+    # Start tunnel
+    conn = resolve_connection(cfg)
+    ip = conn.ip
+    if not ip:
+        fatal("Could not detect phone IP.\nIs USB tethering or ethernet connected?")
+    check_dep("ssh")
+    cmd = ["ssh", "-D", str(socks_port), "-q", "-N",
+           "-o", "StrictHostKeyChecking=no",
+           "-o", "UserKnownHostsFile=/dev/null",
+           "-o", "ServerAliveInterval=30",
+           "-p", str(conn.ssh_port), f"{conn.ssh_user}@{ip}"]
+    if conn.ssh_key:
+        cmd.extend(["-i", conn.ssh_key])
+
+    proc = subprocess.Popen(cmd, stdout=NULL, stderr=NULL)
+    with open(pid_file, "w") as f:
+        f.write(str(proc.pid))
+    success(f"Tunnel started (PID: {proc.pid}, port {socks_port})")
+    try:
+        subprocess.run(["notify-send", "-u", "low", "DPI Tunnel", f"Connected via {ip}."],
+                       stdout=NULL, stderr=NULL)
+    except Exception:
+        pass
+
+
+def cmd_home(args):
+    """Send HOME key event to Android device"""
+    cfg = load_config()
+    serial = require_adb(cfg)
+    subprocess.run(["adb", "-s", serial, "shell", "input", "keyevent", "3"],
+                   stdout=NULL, stderr=NULL)
+    success("HOME key sent.")
+
+
+def cmd_kvm(args):
+    """Seamless KVM mode (edge swipe to Android, RCtrl to return)"""
+    cfg = load_config()
+    _run_kvm(cfg)
+
+
+def cmd_app(args):
+    """App management (install, uninstall, list, search, local)"""
+    cfg = load_config()
+    if args.subcommand is None:
+        info("Usage: droid app local | install <name> | uninstall <name> | list [filter]")
+        return
+    serial = require_adb(cfg)
+    _app_management(args, cfg, serial)
+
+
+def cmd_app_modules(args):
+    """Magisk module management"""
+    cfg = load_config()
+    if args.module_subcommand is None:
+        info("Usage: droid modules [list | remove | flash]")
+        return
+    serial = require_adb(cfg)
+    _module_management(args, cfg, serial)
+
+
+def cmd_debloat(args):
+    """Remove bloatware from device"""
+    cfg = load_config()
+    serial = require_adb(cfg)
+    _debloat(args, cfg, serial)
+
+
+def cmd_mirror(args):
+    """Mirror phone screen on PC (with optional --bitrate)"""
+    cfg = load_config()
+    serial = require_adb(cfg)
+    _mirror(args, cfg, serial)
+
+
+def cmd_launch(args):
+    """Launch Android app via fuzzel + scrcpy"""
+    cfg = load_config()
+    serial = require_adb(cfg)
+    _launch_app(args, cfg, serial)
+
+
+def cmd_external_launch(args):
+    """Launch Android app on external monitor via ADB"""
+    cfg = load_config()
+    serial = require_adb(cfg)
+    _external_launch(args, cfg, serial)
+
+
+def cmd_droidconnect(args):
+    """Connect to DroidSpaces container"""
+    cfg = load_config()
+    serial = require_adb(cfg)
+    _droidconnect(args, cfg, serial)
+
+
+def cmd_wiki(args):
+    """Start/stop Kiwix offline Wikipedia server"""
+    cfg = load_config()
+    _wiki(args, cfg)
+
+
+def cmd_music(args):
+    """Download YouTube audio/video with folder picker"""
+    cfg = load_config()
+    _music(args, cfg)
+
+
+def cmd_config(args):
+    """View or edit configuration"""
+    cfg = load_config()
+    if args.show:
+        conn = resolve_connection(cfg)
+        data = json.loads(json.dumps(cfg))
+        for k in DETECTED_FIELDS:
+            if k in data:
+                data[k] = f"{data[k]} (auto)"
+        print(json.dumps(data, indent=2))
+    elif args.set_key and args.set_val:
+        cfg[args.set_key] = args.set_val
+        DETECTED_FIELDS.discard(args.set_key)
+        save_config(cfg)
+        success(f"{args.set_key} = {args.set_val}")
+    elif args.reset:
+        save_config(DEFAULT_CONFIG)
+        DETECTED_FIELDS.clear()
+        success("Config reset to defaults.")
+    else:
+        print(json.dumps(cfg, indent=2))
+
+
+def cmd_init(args):
+    """Initialize config — probe wizard + dep check"""
+    cfg = load_config()
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    fresh = not CONFIG_FILE.exists()
+
+    conn = resolve_connection(cfg)
+    detected = {}
+    if conn.iface:
+        detected["ssh_interface"] = conn.iface
+    if conn.ssh_port:
+        detected["ssh_port"] = conn.ssh_port
+    if conn.ssh_user:
+        detected["ssh_user"] = conn.ssh_user
+    if conn.ssh_key:
+        detected["ssh_key"] = conn.ssh_key
+    if conn.adb_serial and not conn.adb_serial.endswith("(unauthorized)"):
+        container = _detect_droid_container(conn.adb_serial)
+        if container:
+            detected["droid_container"] = container
+
+    if fresh and detected:
+        for k, v in detected.items():
+            cfg[k] = v
+            DETECTED_FIELDS.add(k)
+        save_config(cfg)
+
+    # Connection summary
+    lines = [
+        ("ADB Serial", conn.adb_serial or "not found"),
+        ("Phone IP", conn.ip or "not found"),
+        ("SSH Port", str(conn.ssh_port)),
+        ("SSH User", conn.ssh_user or "not found"),
+        ("SSH Key", conn.ssh_key or "not found"),
+        ("Interface", conn.iface or "not found"),
+        ("DroidSpaces", detected.get("droid_container", "not probed")),
+    ]
+
+    probe_icons = {
+        "ADB Serial": "🔌",
+        "Phone IP": "🌐",
+        "SSH Port": "🔢",
+        "SSH User": "👤",
+        "SSH Key": "🔑",
+        "Interface": "📶",
+        "DroidSpaces": "📦",
+    }
+    if RICH:
+        _console = Console()
+        t = Table(box=rich_box.SIMPLE, show_header=False)
+        t.add_column(style="cyan", width=22)
+        t.add_column(style="white")
+        for k, v in lines:
+            marker = DIM + "(auto)" + RESET if k.replace(" ", "_").lower() in DETECTED_FIELDS or any(
+                k.lower().startswith(x.lower()) for x in detected) else ""
+            icon = probe_icons.get(k, "  ")
+            label = v
+            if marker:
+                label = f"{v}  {marker}"
+            t.add_row(f"{icon}  {k}", label)
+        _console.print(Panel(t, title="Connection Probe", border_style="cyan"))
+    else:
+        print(f"{BOLD}Connection Probe:{RESET}")
+        for k, v in lines:
+            marker = "(auto)" if k.replace(" ", "_").lower() in DETECTED_FIELDS or any(
+                k.lower().startswith(x.lower()) for x in detected) else ""
+            icon = probe_icons.get(k, " ")
+            entry = f"  {icon}  {k+':':16s} {v}"
+            if marker:
+                entry += f" {DIM}{marker}{RESET}"
+            print(entry)
+        print()
+
+    deps = {
+        "adb": "sudo pacman -S android-tools",
+        "ssh": "openssh",
+        "scrcpy": "sudo pacman -S scrcpy",
+        "fuzzel": "sudo pacman -S fuzzel",
+        "fzf": "sudo pacman -S fzf",
+        "jq": "sudo pacman -S jq",
+        "sshfs": "sudo pacman -S sshfs",
+        "fusermount3": "sudo pacman -S fuse3",
+        "kiwix-serve": "Install kiwix-tools from kiwix.org",
+        "yt-dlp": "sudo pacman -S yt-dlp",
+        "wl-copy": "sudo pacman -S wl-clipboard",
+    }
+    missing = []
+    if RICH:
+        _console.print()
+    for cmd_, hint in deps.items():
+        if shutil.which(cmd_):
+            success(f"{cmd_} found")
+        else:
+            err(f"{cmd_} missing — {hint}")
+            missing.append(cmd_)
+    if missing:
+        if RICH:
+            _console.print(Panel(f"{len(missing)} dependencies missing. See hints above.",
+                                border_style="red"))
+        else:
+            info(f"{len(missing)} dependencies missing. See hints above.")
+    else:
+        msg = "All dependencies satisfied."
+        if RICH:
+            _console.print(Panel(msg, border_style="green"))
+        else:
+            bold(msg)
+
+
+# ── Core implementations ──────────────────────────────────────────────────────
+
+def _run_kvm(cfg: dict):
+    """Seamless KVM implementation (from 1.py)"""
+    WINDOW_TITLE = "Android-Input"
+    LOG = "/tmp/scrcpy-kvm.log"
+    EDGE_DEBOUNCE = 3
+    POLL_INTERVAL = 0.016
+
+    def notify(icon, title, msg, urgency="normal"):
+        try:
+            subprocess.Popen(
+                ["notify-send", "-u", urgency, "-a", "Android KVM", title, f"{icon} {msg}"],
+                stdout=NULL, stderr=NULL
+            )
+        except FileNotFoundError:
+            pass
+
+    check_dep("ydotool", "sudo pacman -S ydotool")
+    status = subprocess.run(
+        ["systemctl", "--user", "is-active", "ydotool"],
+        capture_output=True, text=True
+    ).stdout.strip()
+    if status != "active":
+        fatal("ydotool daemon is not active.\nRun: systemctl --user enable --now ydotool", "Android KVM")
+
+    _rctrl_event = threading.Event()
+    _stop_flag = threading.Event()
+
+    def _rctrl_listener(stop_flag):
+        try:
+            import evdev
+            from evdev import ecodes
+        except ImportError:
+            info("python-evdev not available, RCtrl not monitored")
+            return
+        KEY_RIGHTCTRL = ecodes.KEY_RIGHTCTRL
+
+        def open_keyboards():
+            boards = []
+            for path in evdev.list_devices():
+                try:
+                    dev = evdev.InputDevice(path)
+                    cap = dev.capabilities()
+                    if ecodes.EV_KEY in cap and KEY_RIGHTCTRL in cap[ecodes.EV_KEY]:
+                        boards.append(dev)
+                except Exception:
+                    pass
+            return boards
+
+        keyboards = open_keyboards()
+        if not keyboards:
+            return
+        import selectors
+        sel = selectors.DefaultSelector()
+        for kb in keyboards:
+            sel.register(kb, selectors.EVENT_READ)
+        while not stop_flag.is_set():
+            ready = sel.select(timeout=0.5)
+            for key, _ in ready:
+                dev = key.fileobj
+                try:
+                    for event in dev.read():
+                        if (event.type == ecodes.EV_KEY
+                                and event.code == KEY_RIGHTCTRL
+                                and event.value == 1):
+                            _rctrl_event.set()
+                except Exception:
+                    pass
+        sel.close()
+        for kb in keyboards:
+            try:
+                kb.close()
+            except Exception:
+                pass
+
+    def hyprctl_request(cmd):
+        sig = os.environ.get("HYPRLAND_INSTANCE_SIGNATURE")
+        if sig:
+            xdg = os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
+            for p in [f"{xdg}/hypr/{sig}/.socket.sock", f"/tmp/hypr/{sig}/.socket.sock"]:
+                if os.path.exists(p):
+                    try:
+                        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                        s.settimeout(3.0)
+                        s.connect(p)
+                        s.sendall(f"-j/{cmd}".encode())
+                        chunks = []
+                        while True:
+                            data = s.recv(8192)
+                            if not data:
+                                break
+                            chunks.append(data)
+                        s.close()
+                        return b"".join(chunks).decode()
+                    except socket.timeout:
+                        s.close()
+                    except Exception:
+                        pass
+        return subprocess.check_output(["hyprctl", "-j", cmd], timeout=5).decode()
+
+    def get_active_workspace():
+        try:
+            return json.loads(hyprctl_request("activeworkspace")).get("id", 1)
+        except Exception:
+            return 1
+
+    def get_monitors():
+        try:
+            return json.loads(hyprctl_request("monitors"))
+        except Exception:
+            return []
+
+    _mon_cache = {"data": [], "ts": 0.0}
+
+    def cached_monitors():
+        now = time.monotonic()
+        if not _mon_cache["data"] or now - _mon_cache["ts"] > 30.0:
+            _mon_cache["data"] = get_monitors()
+            _mon_cache["ts"] = now
+        return _mon_cache["data"]
+
+    def get_focused_monitor_bounds():
+        for m in cached_monitors():
+            if m.get("focused"):
+                scale = m.get("scale", 1.0)
+                return int(m["width"] / scale), int(m["height"] / scale), int(m["x"]), int(m["y"])
+        return 1920, 1080, 0, 0
+
+    def get_right_edge():
+        mons = cached_monitors()
+        if not mons:
+            return 1920
+        return max(m["x"] + int(m["width"] / m.get("scale", 1.0)) for m in mons)
+
+    def get_cursor_pos():
+        try:
+            data = json.loads(hyprctl_request("cursorpos"))
+            return int(data.get("x", 0)), int(data.get("y", 0))
+        except Exception:
+            try:
+                out = subprocess.check_output(["hyprctl", "cursorpos"], timeout=5).decode()
+                x_str, y_str = out.strip().split(",")
+                return int(x_str.strip()), int(y_str.strip())
+            except Exception:
+                return 0, 0
+
+    conn = resolve_connection(cfg)
+    if not conn.adb_ok:
+        if cfg.get("adb_connect_auto", True) and conn.ip:
+            subprocess.run(["adb", "connect", f"{conn.ip}:5555"],
+                           capture_output=True, timeout=5)
+            conn2 = resolve_connection(cfg)
+            if not conn2.adb_ok:
+                fatal("No ADB device found.", "Android KVM")
+            serial = conn2.adb_serial
+        else:
+            fatal("No ADB device found.", "Android KVM")
+    else:
+        serial = conn.adb_serial
+
+    def setup_hyprland_rules():
+        title_match = f"title:^({WINDOW_TITLE})$"
+        class_match = "class:^(scrcpy)$"
+        for m in (title_match, class_match):
+            subprocess.run(["hyprctl", "keyword", "windowrule",
+                            f"noanim,{m}"], stdout=NULL, stderr=NULL)
+            subprocess.run(["hyprctl", "keyword", "windowrule",
+                            f"opacity 0.0 override 0.0 override,{m}"], stdout=NULL, stderr=NULL)
+        for rule in [
+            f"noborder,{title_match}",
+            f"noblur,{title_match}",
+            f"noshadow,{title_match}",
+            f"move -9999 -9999,{title_match}",
+            f"move -9999 -9999,{class_match}",
+            f"size 200 200,{title_match}",
+            f"float,{title_match}",
+            f"workspace special:kvm silent,{title_match}",
+            f"workspace special:kvm silent,{class_match}",
+            f"suppressevent activate activatefocus,{title_match}",
+            f"suppressevent activate activatefocus,{class_match}",
+            f"noinitialfocus,{title_match}",
+            f"noinitialfocus,{class_match}",
+        ]:
+            subprocess.run(["hyprctl", "keyword", "windowrule", rule],
+                           stdout=NULL, stderr=NULL)
+
+    setup_hyprland_rules()
+    cmd = [
+        "scrcpy",
+        f"--serial={serial}",
+        "--no-video",
+        "--no-audio",
+        "--keyboard=sdk",
+        "--mouse=uhid",
+        "--mouse-bind=++++:++++",
+        "--stay-awake",
+        f"--window-title={WINDOW_TITLE}",
+        "--shortcut-mod=rctrl",
+    ]
+    log_file = open(LOG, "w")
+    scrcpy_proc = subprocess.Popen(cmd, stdout=log_file, stderr=log_file)
+    time.sleep(1.5)
+    notify("*", "Android KVM", "Seamless KVM active! Move mouse to right edge.", "normal")
+
+    listener_thread = threading.Thread(
+        target=_rctrl_listener, args=(_stop_flag,), daemon=True
+    )
+    listener_thread.start()
+
+    is_on_android = False
+    right_edge = get_right_edge()
+    EDGE_TRIGGER = max(right_edge - 2, 0)
+    edge_count = 0
+
+    try:
+        while scrcpy_proc.poll() is None:
+            x, y = get_cursor_pos()
+            if not is_on_android:
+                if x >= EDGE_TRIGGER:
+                    edge_count += 1
+                    if edge_count >= EDGE_DEBOUNCE:
+                        is_on_android = True
+                        edge_count = 0
+                        _rctrl_event.clear()
+                        notify("*", "Android KVM", "Switched to Android! (RCtrl to return)", "low")
+                        active_ws = get_active_workspace()
+                        w, h, mx, my = get_focused_monitor_bounds()
+                        batch = (
+                            f"dispatch movetoworkspacesilent {active_ws},title:^({WINDOW_TITLE})$ ; "
+                            f"dispatch focuswindow title:^({WINDOW_TITLE})$ ; "
+                            f"dispatch movecursor {mx + w // 2} {my + h // 2}"
+                        )
+                        subprocess.run(["hyprctl", "--batch", batch], stdout=NULL, stderr=NULL)
+                        time.sleep(0.04)
+                        subprocess.run(["ydotool", "click", "0xC0"], stdout=NULL, stderr=NULL)
+                else:
+                    edge_count = 0
+            elif _rctrl_event.is_set():
+                _rctrl_event.clear()
+                is_on_android = False
+                edge_count = 0
+                subprocess.run(
+                    ["hyprctl", "dispatch", "movetoworkspacesilent",
+                     f"special:kvm,title:^({WINDOW_TITLE})$"],
+                    stdout=NULL, stderr=NULL
+                )
+                notify("*", "Android KVM", "Returned to PC (RCtrl)", "low")
+            elif is_on_android:
+                w, h, mx, my = get_focused_monitor_bounds()
+                if x < (mx + w // 2) - 250:
+                    is_on_android = False
+                    edge_count = 0
+                    subprocess.run(
+                        ["hyprctl", "dispatch", "movetoworkspacesilent",
+                         f"special:kvm,title:^({WINDOW_TITLE})$"],
+                        stdout=NULL, stderr=NULL
+                    )
+                    notify("*", "Android KVM", "Returned to PC", "low")
+            time.sleep(POLL_INTERVAL)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        _stop_flag.set()
+        scrcpy_proc.terminate()
+        log_file.close()
+        notify("*", "Android KVM", "Session ended cleanly.", "low")
+
+
+def _app_local(serial: str, cfg: dict):
+    APK_DIR = cfg["apk_dir"]
+    check_dep("adb")
+    files = sorted(Path(APK_DIR).glob("*.apk"))
+    files += sorted(Path(APK_DIR).glob("*.xapk"))
+    files += sorted(Path(APK_DIR).glob("*.apkm"))
+    if not files:
+        err(f"No packages found in {APK_DIR}")
+        return
+    choice = _fzf_pick([f.name for f in files], "Select APK")
+    if not choice:
+        return
+    target = next((f for f in files if f.name == choice), None)
+    if target:
+        _install_apk(serial, str(target), APK_DIR)
+
+
+def _app_management(args, cfg: dict, serial: str):
+    APK_DIR = cfg["apk_dir"]
+    Path(APK_DIR).mkdir(parents=True, exist_ok=True)
+
+    if args.subcommand is None:
+        info("Usage: droid app local | install <name> | uninstall <name> | list [filter]")
+        return
+
+    if args.subcommand == "local":
+        _app_local(serial, cfg)
+
+    elif args.subcommand in ("install", "search"):
+        query = " ".join(args.query) if args.query else ""
+        if not query:
+            _app_local(serial, cfg)
+            return
+        check_dep("apkeep", "cargo install apkeep")
+        check_dep("python3")
+        results = _search_play_store(query)
+        if not results:
+            err("No apps found.")
+            return
+        selected = _fzf_pick([f"{name}  [{pkg}]" for name, pkg in results], "Select app")
+        if not selected:
+            return
+        selected = selected.split("  [")[-1].rstrip("]")
+        info(f"Downloading {selected}...")
+        r = subprocess.run(
+            ["apkeep", "-a", selected, "-d", "apk-pure", APK_DIR],
+            capture_output=True, text=True
+        )
+        if r.returncode != 0:
+            err("Download failed.")
+            return
+        dl = list(Path(APK_DIR).glob(f"{selected}*.apk"))
+        dl += list(Path(APK_DIR).glob(f"{selected}*.xapk"))
+        dl += list(Path(APK_DIR).glob(f"{selected}*.apkm"))
+        if not dl:
+            dl = sorted(Path(APK_DIR).iterdir(), key=os.path.getmtime)[-1:]
+        if dl:
+            _install_apk(serial, str(dl[0]), APK_DIR)
+        else:
+            err("Could not find downloaded file.")
+
+    elif args.subcommand == "uninstall":
+        query = " ".join(args.query) if args.query else ""
+        if not query:
+            err("Specify a package name or search term.")
+            return
+        r = subprocess.run(
+            ["adb", "-s", serial, "shell", "pm", "list", "packages"],
+            capture_output=True, text=True, timeout=10
+        )
+        pkgs = [l.replace("package:", "").strip() for l in r.stdout.splitlines()
+                if l.startswith("package:")]
+        matches = [p for p in pkgs if query.lower() in p.lower()]
+        if not matches:
+            err(f"No packages match '{query}'")
+            return
+        if len(matches) == 1:
+            selected = matches[0]
+        else:
+            selected = _fzf_pick(matches, "Select package to uninstall")
+            if not selected:
+                return
+        r = subprocess.run(
+            ["adb", "-s", serial, "shell", "pm", "uninstall", selected],
+            capture_output=True, text=True
+        )
+        if "Success" in r.stdout:
+            success(f"{selected} uninstalled.")
+        else:
+            r2 = subprocess.run(
+                ["adb", "-s", serial, "shell", "pm", "uninstall", "--user", "0", selected],
+                capture_output=True, text=True
+            )
+            if "Success" in r2.stdout:
+                success(f"{selected} uninstalled (system app).")
+            else:
+                err(f"Could not uninstall {selected}.")
+
+    elif args.subcommand == "list":
+        filter_str = " ".join(args.query) if args.query else ""
+        r = subprocess.run(
+            ["adb", "-s", serial, "shell", "pm", "list", "packages"],
+            capture_output=True, text=True, timeout=10
+        )
+        pkgs = [l.replace("package:", "").strip() for l in r.stdout.splitlines()
+                if l.startswith("package:")]
+        if filter_str:
+            pkgs = [p for p in pkgs if filter_str.lower() in p.lower()]
+        pkgs.sort()
+        print(f"{BOLD}Packages ({len(pkgs)}):{RESET}")
+        for p in pkgs:
+            print(f"  {DIM}\u2022{RESET} {p}")
+
+
+def _search_play_store(query: str) -> List[Tuple[str, str]]:
+    import urllib.request, urllib.parse
+    from concurrent.futures import ThreadPoolExecutor
+
+    encoded = urllib.parse.quote(query)
+    UA = "Mozilla/5.0 (X11; Linux x86_64; rv:124.0) Gecko/20100101 Firefox/124.0"
+
+    def fetch(url):
+        req = urllib.request.Request(url, headers={"User-Agent": UA})
+        return urllib.request.urlopen(req, timeout=10).read().decode("utf-8", errors="ignore")
+
+    try:
+        html = fetch(f"https://play.google.com/store/search?q={encoded}&c=apps&hl=en_US")
+    except Exception:
+        return []
+
+    packages, seen = [], set()
+    for pkg in re.findall(r"details\?id=([a-zA-Z][a-zA-Z0-9_.]+)", html):
+        if "." in pkg and pkg not in seen:
+            seen.add(pkg)
+            packages.append(pkg)
+        if len(packages) >= 8:
+            break
+
+    def get_name(pkg):
+        try:
+            h = fetch(f"https://play.google.com/store/apps/details?id={pkg}&hl=en_US")
+            m = re.search(r"<title>(.+?) - Apps on Google Play</title>", h)
+            if m:
+                return pkg, m.group(1).strip()
+        except Exception:
+            pass
+        return pkg, pkg
+
+    with ThreadPoolExecutor(max_workers=6) as ex:
+        return list(ex.map(get_name, packages))
+
+
+def _install_apk(serial: str, target: str, apk_dir: str):
+    path = Path(target)
+    if path.suffix == ".apk":
+        info(f"Installing {path.name}...")
+        r = subprocess.run(["adb", "-s", serial, "install", "-r", str(path)],
+                           capture_output=True, text=True)
+        if r.returncode == 0:
+            success(f"{path.name} installed.")
+        else:
+            err(f"Install failed: {r.stderr.strip()}")
+    elif path.suffix in (".xapk", ".apkm"):
+        info(f"Extracting {path.name}...")
+        check_dep("unzip", "sudo pacman -S unzip")
+        tmp = Path(apk_dir) / f".tmp_extract_{os.getpid()}"
+        shutil.rmtree(tmp, ignore_errors=True)
+        tmp.mkdir(parents=True)
+        r = subprocess.run(["unzip", "-q", str(path), "-d", str(tmp)], capture_output=True)
+        if r.returncode != 0:
+            err(f"Failed to extract {path.name}: {r.stderr.strip()}")
+            shutil.rmtree(tmp, ignore_errors=True)
+            return
+        apks = sorted(tmp.rglob("*.apk"))
+        if not apks:
+            err("No APKs inside archive.")
+            shutil.rmtree(tmp, ignore_errors=True)
+            return
+        info(f"Installing {len(apks)} split APK(s)...")
+        cmd = ["adb", "-s", serial, "install-multiple", "-r"] + [str(a) for a in apks]
+        r = subprocess.run(cmd, capture_output=True, text=True)
+        if r.returncode == 0:
+            success(f"{path.name} installed.")
+        else:
+            err(f"Split install failed: {r.stderr.strip()}")
+        shutil.rmtree(tmp, ignore_errors=True)
+    else:
+        err(f"Unsupported: {path.suffix}")
+
+
+def _module_management(args, cfg: dict, serial: str):
+    MODULES_DIR = Path(cfg["modules_dir"])
+    MODULES_DIR.mkdir(parents=True, exist_ok=True)
+
+    def check_root():
+        r = subprocess.run(
+            ["adb", "-s", serial, "shell", "su -c id"],
+            capture_output=True, text=True, timeout=5
+        )
+        if "uid=0" not in r.stdout:
+            fatal("Root required.\nMake sure ADB shell root is granted in Magisk.")
+
+    def get_modules():
+        r = subprocess.run(
+            ["adb", "-s", serial, "shell", "su -c 'ls /data/adb/modules/'"],
+            capture_output=True, text=True, timeout=10
+        )
+        return [m.strip() for m in r.stdout.splitlines() if m.strip()]
+
+    if args.module_subcommand == "list":
+        check_root()
+        mods = get_modules()
+        if not mods:
+            info("No modules or Magisk not installed.")
+            return
+        for mod in mods:
+            r = subprocess.run(
+                ["adb", "-s", serial, "shell",
+                 f"su -c 'cat /data/adb/modules/{mod}/module.prop 2>/dev/null | grep ^name='"],
+                capture_output=True, text=True, timeout=5
+            )
+            name = r.stdout.replace("name=", "").strip()
+            label = f"{name} ({mod})" if name else mod
+            print(f"  {DIM}\u2022{RESET} {label}")
+
+    elif args.module_subcommand == "remove":
+        check_root()
+        mods = get_modules()
+        if not mods:
+            err("No modules found.")
+            return
+        selected = _fzf_pick(mods, "Select module to remove")
+        if not selected:
+            return
+        subprocess.run(
+            ["adb", "-s", serial, "shell",
+             f"su -c 'touch /data/adb/modules/{selected}/remove'"],
+            stdout=NULL, stderr=NULL
+        )
+        success(f"{selected} marked for removal (reboot to apply).")
+
+    else:  # flash
+        check_root()
+        zips = sorted(MODULES_DIR.glob("*.zip"))
+        if not zips:
+            err(f"No .zip files in {MODULES_DIR}")
+            return
+        choice = _fzf_pick([z.name for z in zips], "Select module zip")
+        if not choice:
+            return
+        target = str(MODULES_DIR / choice)
+        fname = choice
+        remote = f"/sdcard/Download/{fname}"
+        info(f"Pushing {fname}...")
+        subprocess.run(["adb", "-s", serial, "push", target, remote],
+                       stdout=NULL, stderr=NULL)
+        info("Flashing module...")
+        r = subprocess.run(
+            ["adb", "-s", serial, "shell", f"su -c 'magisk --install-module \"{remote}\"'"],
+            capture_output=True, text=True, timeout=60
+        )
+        print(r.stdout)
+        subprocess.run(
+            ["adb", "-s", serial, "shell", f"su -c 'rm -f \"{remote}\"'"],
+            stdout=NULL, stderr=NULL
+        )
+        if r.returncode == 0:
+            success(f"{fname} flashed.")
+            confirm = input("  Reboot now? [y/N] ").strip().lower()
+            if confirm == "y":
+                subprocess.run(["adb", "-s", serial, "reboot"], stdout=NULL, stderr=NULL)
+        else:
+            err("Flash failed.")
+
+
+def _debloat(args, cfg: dict, serial: str):
+    profile_name = args.profile or cfg.get("default_debloat_profile", "generic")
+    profiles = cfg.get("debloat_profiles", {})
+    profile = profiles.get(profile_name, profiles.get("generic", {}))
+
+    if args.list_profiles:
+        bold("Available debloat profiles:")
+        for name in profiles:
+            marker = " (default)" if name == cfg.get("default_debloat_profile") else ""
+            print(f"  {DIM}\u2022{RESET} {name}{marker}")
+        return
+
+    if args.list_packages:
+        bold(f"Packages in profile '{profile_name}':")
+        for category, pkgs in profile.items():
+            if pkgs:
+                print(f"\n  {BOLD}{category}:{RESET}")
+                for p in pkgs:
+                    print(f"    {DIM}\u2022{RESET} {p}")
+        return
+
+    all_pkgs = []
+    for cat, pkgs in profile.items():
+        all_pkgs.extend(pkgs)
+
+    if not all_pkgs:
+        err(f"No packages defined in profile '{profile_name}'.")
+        return
+
+    print(f"{BOLD}Debloating with profile '{profile_name}' ({len(all_pkgs)} packages){RESET}\n")
+
+    for pkg in all_pkgs:
+        r = subprocess.run(
+            ["adb", "-s", serial, "shell", "pm", "uninstall", "-k", "--user", "0", pkg],
+            capture_output=True, text=True, timeout=10
+        )
+        status = "OK" if "Success" in (r.stdout + r.stderr) else "FAILED"
+        color = GREEN if status == "OK" else RED
+        print(f"  {color}[{status}]{RESET} {pkg}")
+
+    bold("\nDone. Recommend reboot: adb reboot")
+
+
+def _mirror(args, cfg: dict, serial: str):
+    check_dep("scrcpy", "sudo pacman -S scrcpy")
+
+    pkill = subprocess.run(["pkill", "-f", "scrcpy.*DROID_MIRROR"],
+                           stdout=NULL, stderr=NULL)
+    title = "DROID_MIRROR"
+    workspace = args.workspace or 2
+    bitrate = args.bitrate or "4M"
+
+    subprocess.run(["hyprctl", "keyword", "windowrule", f"workspace {workspace},title:^({title})$"],
+                   stdout=NULL, stderr=NULL)
+    subprocess.run(["hyprctl", "keyword", "windowrule", f"fullscreen 2,title:^({title})$"],
+                   stdout=NULL, stderr=NULL)
+    if bitrate == "8M":
+        subprocess.run(["hyprctl", "keyword", "windowrule", f"border_size 0,title:^({title})$"],
+                       stdout=NULL, stderr=NULL)
+        subprocess.run(["hyprctl", "keyword", "windowrule", f"rounding 0,title:^({title})$"],
+                       stdout=NULL, stderr=NULL)
+        subprocess.run(["hyprctl", "keyword", "windowrule", f"noanim,title:^({title})$"],
+                       stdout=NULL, stderr=NULL)
+
+    subprocess.run(
+        ["adb", "-s", serial, "shell", "cmd", "power",
+         "set-fixed-performance-mode-enabled", "true"],
+        stdout=NULL, stderr=NULL
+    )
+    for setting in ["window_animation_scale", "transition_animation_scale", "animator_duration_scale"]:
+        subprocess.run(
+            ["adb", "-s", serial, "shell", "settings", "put", "global", setting, "0"],
+            stdout=NULL, stderr=NULL
+        )
+
+    cmd = [
+        "scrcpy", "-s", serial,
+        "--new-display=1920x1080/284",
+        "--video-codec=h264",
+        f"--video-bit-rate={bitrate}",
+        "--max-fps=60",
+        "--keyboard=uhid",
+        "--video-buffer=0",
+        "--no-audio",
+        "--window-borderless",
+        "--turn-screen-off",
+        "--no-clipboard-autosync",
+        "--fullscreen",
+        f"--window-title={title}",
+    ]
+    env = os.environ.copy()
+    env["SDL_VIDEODRIVER"] = "wayland"
+    proc = subprocess.Popen(cmd, env=env, stdout=NULL, stderr=NULL)
+    time.sleep(1.5)
+    subprocess.run(["hyprctl", "dispatch", "workspace", str(workspace)],
+                   stdout=NULL, stderr=NULL)
+    try:
+        proc.wait()
+    except KeyboardInterrupt:
+        proc.terminate()
+    finally:
+        subprocess.run(
+            ["adb", "-s", serial, "shell", "cmd", "power",
+             "set-fixed-performance-mode-enabled", "false"],
+            stdout=NULL, stderr=NULL
+        )
+
+
+def _launch_app(args, cfg: dict, serial: str):
+    """Android app launcher via fuzzel + scrcpy"""
+    check_dep("fuzzel", "sudo pacman -S fuzzel")
+    check_dep("scrcpy", "sudo pacman -S scrcpy")
+    check_dep("jq", "sudo pacman -S jq")
+
+    if args.pkg:
+        target_pkg = args.pkg
+        app_label = target_pkg.split(".")[-1]
+    else:
+        r = subprocess.run(
+            ["adb", "-s", serial, "shell", "pm", "list", "packages", "-3"],
+            capture_output=True, text=True, timeout=10
+        )
+        raw = r.stdout.strip().splitlines()
+        apps = []
+        for line in raw:
+            pkg = line.replace("package:", "").strip()
+            if pkg:
+                label = pkg.split(".")[-1]
+                apps.append((label, pkg))
+
+        if not apps:
+            err("No user apps found.")
+            return
+
+        display_lines = [f"{l}  [{p}]" for l, p in apps]
+        fuzzel_in = "\n".join(display_lines)
+        r2 = subprocess.run(
+            ["fuzzel", "--dmenu", "--prompt", "Android App: "],
+            input=fuzzel_in, capture_output=True, text=True
+        )
+        selection = r2.stdout.strip()
+        if not selection:
+            return
+
+        target_pkg = None
+        for line, (label, pkg) in zip(display_lines, apps):
+            if line == selection:
+                target_pkg = pkg
+                break
+        if not target_pkg:
+            err("Could not resolve package.")
+            return
+
+        app_label = selection.split("  [")[0]
+    info(f"Launching {app_label}...")
+
+    if args.portrait:
+        display_size = "1080x1920/420"
+    else:
+        try:
+            mon = json.loads(subprocess.check_output(
+                ["hyprctl", "-j", "monitors"], timeout=5).decode())
+            focused = [m for m in mon if m.get("focused")][0]
+            mon_w = focused.get("width", 1920)
+            mon_h = focused.get("height", 1080)
+            ws_id = 1
+            try:
+                aw = json.loads(subprocess.check_output(
+                    ["hyprctl", "-j", "activewindow"], timeout=5).decode())
+                ws_id = aw.get("workspace", {}).get("id", 1)
+            except Exception:
+                pass
+            clients = json.loads(subprocess.check_output(
+                ["hyprctl", "-j", "clients"], timeout=5).decode())
+            tile_count = len([c for c in clients
+                              if c.get("workspace", {}).get("id") == ws_id
+                              and not c.get("floating")])
+            tile_w = mon_w // (tile_count + 1) if tile_count > 0 else mon_w
+            display_size = f"{tile_w}x{mon_h}/240"
+        except Exception:
+            display_size = "1920x1080/240"
+
+    subprocess.Popen(
+        ["scrcpy",
+         f"--serial={serial}",
+         f"--new-display={display_size}",
+         f"--start-app={target_pkg}",
+         f"--window-title=Android: {app_label}",
+         "--audio-source=output"],
+        stdout=NULL, stderr=NULL
+    )
+
+
+def _external_launch(args, cfg: dict, serial: str):
+    """Launch app on external display ID (no scrcpy)"""
+    check_dep("fuzzel", "sudo pacman -S fuzzel")
+    r = subprocess.run(
+        ["adb", "-s", serial, "shell", "dumpsys", "display"],
+        capture_output=True, text=True, timeout=10
+    )
+    display_ids = set()
+    for m in re.finditer(r"mDisplayId=(\d+)", r.stdout):
+        did = int(m.group(1))
+        if did != 0:
+            display_ids.add(did)
+
+    target_display = args.display_id
+    if target_display is None:
+        target_display = min(display_ids) if display_ids else 1
+
+    r2 = subprocess.run(
+        ["adb", "-s", serial, "shell", "pm", "list", "packages", "-3"],
+        capture_output=True, text=True, timeout=10
+    )
+    apps = []
+    for line in r2.stdout.strip().splitlines():
+        pkg = line.replace("package:", "").strip()
+        if pkg:
+            label = pkg.split(".")[-1]
+            apps.append((label, pkg))
+
+    if not apps:
+        err("No user apps found.")
+        return
+
+    display_lines = [f"{l}  [{p}]" for l, p in apps]
+    fuzzel_in = "\n".join(display_lines)
+    r3 = subprocess.run(
+        ["fuzzel", "--dmenu", "--prompt", f"App on Display {target_display}: "],
+        input=fuzzel_in, capture_output=True, text=True
+    )
+    selection = r3.stdout.strip()
+    if not selection:
+        return
+
+    target_pkg = None
+    for line, (label, pkg) in zip(display_lines, apps):
+        if line == selection:
+            target_pkg = pkg
+            break
+    if not target_pkg:
+        err("Could not resolve package.")
+        return
+
+    activity = subprocess.run(
+        ["adb", "-s", serial, "shell",
+         f"cmd package resolve-activity --brief -c android.intent.category.LAUNCHER {target_pkg}"],
+        capture_output=True, text=True, timeout=10
+    )
+    act_line = next((l.strip() for l in activity.stdout.splitlines() if "/" in l), None)
+
+    if act_line:
+        subprocess.run(
+            ["adb", "-s", serial, "shell",
+             "am", "start",
+             f"--display={target_display}",
+             "-n", act_line,
+             "-f", "0x10200000"],
+            stdout=NULL, stderr=NULL
+        )
+    else:
+        subprocess.run(
+            ["adb", "-s", serial, "shell",
+             f"ANDROID_DATA=/data monkey --display {target_display} -p {target_pkg} -c android.intent.category.LAUNCHER 1"],
+            stdout=NULL, stderr=NULL
+        )
+    success(f"Launched on display {target_display}.")
+
+
+def _droidconnect(args, cfg: dict, serial: str):
+    """Connect to DroidSpaces container"""
+    droid_paths = [
+        "/data/local/Droidspaces/bin/droidspaces",
+        "/data/data/com.termux/files/usr/bin/droidspaces",
+    ]
+    droid_path = None
+    for p in droid_paths:
+        r = subprocess.run(["adb", "-s", serial, "shell", "test", "-f", p],
+                           capture_output=True, timeout=5)
+        if r.returncode == 0:
+            droid_path = p
+            break
+    if not droid_path:
+        fatal("DroidSpaces binary not found on device.")
+    container = args.container or cfg.get("droid_container") or ""
+    if not container:
+        container = _detect_droid_container(serial) or ""
+    if not container:
+        r = subprocess.run(
+            ["adb", "-s", serial, "shell", f"{droid_path} list"],
+            capture_output=True, text=True, timeout=10
+        )
+        containers = [l.strip() for l in r.stdout.splitlines() if l.strip()]
+        if not containers:
+            fatal("No DroidSpaces containers found.")
+        container = containers[0]
+        info(f"Auto-detected container: {container}")
+
+    droid_mode = _detect_droid_mode(serial)
+    socat_port = 6001
+    check_dep("socat", "sudo pacman -S socat")
+
+    if not args.cmd and not args.x11:
+        cmd = ["adb", "-s", serial, "exec-out", f"{droid_path} --name={container} enter"]
+        subprocess.run(cmd)
+        return
+
+    if not args.x11:
+        cmd = ["adb", "-s", serial, "exec-out",
+               f"{droid_path} --name={container} run sh -c {shlex.quote(args.cmd)}"]
+        subprocess.run(cmd)
+        return
+
+    # X11 mode
+    if not subprocess.run(["pgrep", "-f", f"socat.*:{socat_port}.*X1"],
+                          capture_output=True).stdout.strip():
+        subprocess.Popen(
+            ["socat", f"TCP-LISTEN:{socat_port},reuseaddr,fork",
+             "UNIX-CONNECT:/tmp/.X11-unix/X1"],
+            stdout=NULL, stderr=NULL
+        )
+        subprocess.run(["adb", "-s", serial, "reverse", f"tcp:{socat_port}", f"tcp:{socat_port}"],
+                       stdout=NULL, stderr=NULL)
+
+    subprocess.run(["adb", "-s", serial, "wait-for-device"],
+                   stdout=NULL, stderr=NULL)
+
+    shell_cmd = args.cmd or "bash"
+    terminal = "kitty"
+    for term in ["kitty", "ghostty", "alacritty", "foot", "wezterm", "konsole", "gnome-terminal"]:
+        if shutil.which(term):
+            terminal = term
+            break
+    term_cmd = [
+        terminal, "--title", f"droidspaces - {container}",
+        "-e", "adb", "-s", serial, "exec-out",
+        f"{droid_path} --name={container} run env DISPLAY=:1 {shell_cmd}"
+    ]
+    if terminal in ("foot", "ghostty"):
+        term_cmd = [
+            terminal, "--title", f"droidspaces - {container}",
+            "adb", "-s", serial, "exec-out",
+            f"{droid_path} --name={container} run env DISPLAY=:1 {shell_cmd}"
+        ]
+    subprocess.run(term_cmd)
+
+
+def _wiki(args, cfg: dict):
+    """Kiwix offline Wikipedia server"""
+    zim_dir = Path(cfg["kiwix_zim_dir"])
+    port = cfg["kiwix_port"]
+    log_file = Path("/tmp/kiwix-serve.log")
+
+    check_dep("kiwix-serve", "Install kiwix-tools from kiwix.org")
+
+    # Check if running
+    r = subprocess.run(["ss", "-tulpn"], capture_output=True, text=True)
+    if f":{port} " in r.stdout:
+        if args.stop:
+            subprocess.run(["fuser", "-k", f"{port}/tcp"], stdout=NULL, stderr=NULL)
+            try:
+                subprocess.run(["notify-send", "Kiwix", "Server Stopped"],
+                               stdout=NULL, stderr=NULL)
+            except Exception:
+                pass
+            success("Kiwix server stopped.")
+            return
+        info(f"Kiwix already running on port {port}.")
+        return
+
+    if args.stop:
+        info("Not running.")
+        return
+
+    if not zim_dir.exists():
+        err(f"ZIM directory not found: {zim_dir}")
+        return
+
+    zims = sorted(zim_dir.glob("*.zim"))
+    if not zims:
+        err(f"No .zim files in {zim_dir}")
+        return
+
+    laptop_ip = None
+    try:
+        iface = cfg.get("ssh_interface", "")
+        if not iface:
+            iface = "usb0"
+            test = subprocess.run(["ip", "link", "show", iface], capture_output=True, timeout=3)
+            if test.returncode != 0:
+                iface = "eth0"
+        r = subprocess.run(["ip", "addr", "show", iface],
+                           capture_output=True, text=True)
+        m = re.search(r"inet (\d+\.\d+\.\d+\.\d+)", r.stdout)
+        if m:
+            laptop_ip = m.group(1)
+    except Exception:
+        pass
+    if not laptop_ip:
+        try:
+            laptop_ip = subprocess.check_output(["hostname", "-I"], timeout=5).decode().split()[0]
+        except Exception:
+            laptop_ip = "localhost"
+
+    url = f"http://{laptop_ip}:{port}"
+    proc = subprocess.Popen(
+        ["kiwix-serve", "--port", str(port)] + [str(z) for z in zims],
+        stdout=open(log_file, "w"), stderr=subprocess.STDOUT
+    )
+
+    time.sleep(2)
+    r2 = subprocess.run(["ss", "-tulpn"], capture_output=True, text=True)
+    if f":{port} " in r2.stdout:
+        try:
+            subprocess.run(["wl-copy"], input=url.encode(), check=True)
+        except Exception:
+            pass
+        success(f"Kiwix online: {url}")
+        try:
+            subprocess.run(["notify-send", "Kiwix Online",
+                            f"Library: {url}\nCopied to clipboard."],
+                           stdout=NULL, stderr=NULL)
+        except Exception:
+            pass
+    else:
+        err("Kiwix server failed to start.")
+        if log_file.exists():
+            with open(log_file) as f:
+                print(f.read())
+
+
+def _music(args, cfg: dict):
+    """YouTube downloader with folder picker"""
+    base_dir = Path(cfg.get("music_base_dir", str(Path.home() / "Music")))
+    base_dir.mkdir(parents=True, exist_ok=True)
+    state_dir = Path.home() / ".music_last_dir"
+    state_mode = Path.home() / ".music_last_mode"
+
+    check_dep("yt-dlp", "sudo pacman -S yt-dlp")
+
+    default_dir = None
+    if state_dir.exists():
+        d = state_dir.read_text().strip()
+        if (base_dir / d).is_dir():
+            default_dir = d
+
+    default_mode = 1
+    if state_mode.exists():
+        try:
+            default_mode = int(state_mode.read_text().strip())
+        except ValueError:
+            pass
+
+    # List subfolders
+    subdirs = sorted(
+        d.name for d in base_dir.iterdir() if d.is_dir()
+    )
+
+    def pick_folder():
+        nonlocal default_dir
+        print(f"Select folder in {base_dir}:")
+        print("----------------------------------------")
+        print("  [0]  <Create new folder>")
+        for i, name in enumerate(subdirs, 1):
+            marker = " (Current)" if name == default_dir else ""
+            print(f"  [{i}]  {name}{marker}")
+        print("----------------------------------------")
+        default_idx = subdirs.index(default_dir) + 1 if default_dir in subdirs else 0
+        prompt = f"Choose [default: {default_idx}]: " if default_dir else "Choose [default: 0]: "
+        choice = input(prompt).strip()
+        if not choice:
+            choice = str(default_idx)
+        if choice == "0" or not choice:
+            name = input("Enter new folder name: ").strip()
+            if not name:
+                err("Name cannot be empty.")
+                return None
+            (base_dir / name).mkdir(exist_ok=True)
+            return name
+        try:
+            idx = int(choice) - 1
+            if 0 <= idx < len(subdirs):
+                return subdirs[idx]
+        except ValueError:
+            pass
+        err("Invalid selection.")
+        return None
+
+    if args.url:
+        folder = args.dir or default_dir
+        if not folder:
+            folder = pick_folder()
+            if not folder:
+                return
+        selected_dir = base_dir / folder
+        url = args.url
+        mode = args.mode or default_mode
+    else:
+        folder = pick_folder()
+        if not folder:
+            return
+        selected_dir = base_dir / folder
+        url = input("Enter YouTube URL: ").strip()
+        if not url:
+            return
+        print(f"\nDownload mode:")
+        print("  [1]  Audio only (opus)")
+        print("  [2]  Audio + Video (1080p60)")
+        mode_label = "Audio" if default_mode == 1 else "Video"
+        m = input(f"Choose [default: {default_mode} ({mode_label})]: ").strip()
+        if m:
+            try:
+                mode = int(m)
+            except ValueError:
+                err("Invalid input, using default.")
+                mode = default_mode
+        else:
+            mode = default_mode
+
+    state_dir.write_text(folder)
+    state_mode.write_text(str(mode))
+
+    os.chdir(str(selected_dir))
+
+    if mode == 1:
+        info("Downloading audio...")
+        subprocess.run(
+            ["yt-dlp", "-f", "ba", "-x", "--audio-format", "opus",
+             "--embed-thumbnail", "--embed-metadata",
+             "--write-subs", "--write-auto-subs", "--convert-subs", "lrc",
+             "-o", "%(title)s.%(ext)s", url]
+        )
+        success("Done.")
+    else:
+        info("Downloading 1080p60 video...")
+        subprocess.run(
+            ["yt-dlp",
+             "-f", "bestvideo[height<=1080][fps<=60]+bestaudio",
+             "--merge-output-format", "mkv",
+             "--embed-thumbnail", "--embed-metadata",
+             "--write-subs", "--write-auto-subs",
+             "-o", "%(title)s.%(ext)s", url]
+        )
+        success("Done.")
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _pick_number(max_val: int) -> Optional[int]:
+    try:
+        choice = input(f"  Pick a number [1-{max_val}] (q to quit): ").strip()
+        if choice.lower() == "q":
+            return None
+        c = int(choice)
+        if 1 <= c <= max_val:
+            return c
+    except (ValueError, EOFError):
+        pass
+    return None
+
+
+# ── KDE Connect ───────────────────────────────────────────────────────────────
+
+def cmd_kdeconnect(args):
+    """KDE Connect device integration"""
+    check_dep("kdeconnect-cli", "sudo pacman -S kdeconnect")
+
+    def get_devices():
+        r = subprocess.run(
+            ["kdeconnect-cli", "--list-devices", "--id-only"],
+            capture_output=True, text=True, timeout=10
+        )
+        devices = []
+        for line in r.stdout.splitlines():
+            m = re.match(r"(\S+)\s*\(.*?\)", line)
+            if m:
+                devices.append(m.group(1))
+        if not devices:
+            for line in r.stdout.splitlines():
+                parts = line.strip().split()
+                if parts and parts[0] and "@" not in parts[0]:
+                    devices.append(parts[0])
+        return devices
+
+    def get_device_pairs():
+        r = subprocess.run(
+            ["kdeconnect-cli", "--list-devices"],
+            capture_output=True, text=True, timeout=10
+        )
+        pairs = []
+        for line in r.stdout.splitlines():
+            m = re.search(r"(\S+)\s+\((.+?)\)", line)
+            if m:
+                pairs.append((m.group(1), m.group(2)))
+        return pairs
+
+    if args.action == "list":
+        pairs = get_device_pairs()
+        if not pairs:
+            info("No KDE Connect devices found.")
+            return
+        bold("KDE Connect devices:")
+        for dev_id, name in pairs:
+            r = subprocess.run(["kdeconnect-cli", "-d", dev_id, "--ping"],
+                               capture_output=True, timeout=5)
+            mark = "reachable" if r.returncode == 0 else "offline"
+            print(f"  {DIM}\u2022{RESET} {name} ({dev_id}) [{mark}]")
+
+    elif args.action == "ping":
+        if args.device:
+            subprocess.run(["kdeconnect-cli", "-d", args.device, "--ping"])
+        else:
+            subprocess.run(["kdeconnect-cli", "--ping"])
+
+    elif args.action == "send-file":
+        if not args.file:
+            err("Specify a file path with --file.")
+            return
+        cmd = ["kdeconnect-cli", "--share", args.file]
+        if args.device:
+            cmd.extend(["-d", args.device])
+        subprocess.run(cmd)
+        success(f"Sent {args.file}.")
+
+    elif args.action == "share-url":
+        url = args.url or args.file
+        if not url:
+            err("Specify a URL with --url.")
+            return
+        cmd = ["kdeconnect-cli", "--share", url]
+        if args.device:
+            cmd.extend(["-d", args.device])
+        subprocess.run(cmd)
+        success("Shared URL.")
+
+    elif args.action == "find":
+        cmd = ["kdeconnect-cli"]
+        if args.device:
+            cmd.extend(["-d", args.device])
+        cmd.append("--ring")
+        subprocess.run(cmd)
+        success("Finding device...")
+
+    elif args.action == "list-files":
+        devices = get_devices()
+        if not devices:
+            err("No KDE Connect devices.")
+            return
+        target = args.device or devices[0]
+        r = subprocess.run(
+            ["kdeconnect-cli", "-d", target, "--list-notifications"],
+            capture_output=True, text=True, timeout=10
+        )
+        print(r.stdout)
+
+    elif args.action == "sms":
+        if not args.number or not args.message:
+            err("Usage: droid kdeconnect sms --number <phone> --message <text>")
+            return
+        devices = get_devices()
+        if not devices:
+            err("No KDE Connect devices.")
+            return
+        target = args.device or devices[0]
+        subprocess.run(
+            ["kdeconnect-cli", "-d", target, "--send-sms",
+             "--number", args.number, "--message", args.message]
+        )
+        success(f"SMS sent to {args.number}.")
+
+    elif args.action == "share-clip":
+        devices = get_devices()
+        if not devices:
+            err("No KDE Connect devices.")
+            return
+        target = args.device or devices[0]
+        r = subprocess.run(["wl-paste"], capture_output=True, text=True, timeout=5)
+        text = r.stdout.strip()
+        if not text:
+            err("Clipboard empty.")
+            return
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
+            f.write(text)
+            fname = f.name
+        subprocess.run(["kdeconnect-cli", "-d", target, "--share", fname])
+        os.unlink(fname)
+        success(f"Clipboard shared ({len(text)} chars).")
+
+    else:
+        info("Usage: droid kdeconnect list | ping | find | send-file <path> | share-url <url> | sms <number> <msg> | share-clip")
+
+
+# ── Dashboard TUI ─────────────────────────────────────────────────────────────
+
+def cmd_dashboard(args):
+    """Interactive TUI dashboard with live stats + action grid"""
+    try:
+        from textual.app import App, ComposeResult
+        from textual.widgets import Header, Footer, Button, Static
+        from textual.containers import Horizontal, Vertical
+        from textual.reactive import reactive
+    except ImportError:
+        fatal("textual not installed.\nRun: pip install textual")
+
+    from concurrent.futures import ThreadPoolExecutor as TPE
+    POLL_INTERVAL = 5
+
+    def fetch_stats(cfg):
+        conn = resolve_connection(cfg)
+        adb_serials = _get_all_adb_serials()
+        cfg_full = load_config()
+        preferred = cfg_full.get("preferred_device", "")
+        active = conn.adb_serial or preferred or (adb_serials[0] if len(adb_serials) == 1 else "")
+        data = {"adb": "?", "adb_count": len(adb_serials), "adb_serial": active,
+                "adb_serials": adb_serials, "preferred": preferred,
+                "ssh": "?", "battery": "?", "model": "?", "tunnel": "off",
+                "kiwix": "off", "kde": "?", "hostname": "?"}
+        host = _get_host_info()
+        data["hostname"] = host.get("hostname", "?")
+        if shutil.which("kdeconnect-cli"):
+            try:
+                r = subprocess.run(["kdeconnect-cli", "-l", "--id-only"],
+                                   capture_output=True, text=True, timeout=5)
+                kdevices = [l.strip() for l in r.stdout.splitlines() if l.strip()]
+                data["kde"] = f"{len(kdevices)}" if kdevices else "0"
+            except Exception:
+                data["kde"] = "err"
+        if conn.adb_ok and active:
+            data["adb"] = "connected"
+            with TPE(max_workers=4) as pool:
+                def get(prop):
+                    r = subprocess.run(["adb", "-s", active.replace(" (unauthorized)",""),
+                                       "shell", f"getprop {prop}"], capture_output=True, text=True, timeout=5)
+                    return r.stdout.strip()
+                def get_bat():
+                    r = subprocess.run(["adb", "-s", active, "shell", "dumpsys", "battery"],
+                                       capture_output=True, text=True, timeout=5)
+                    level, charging = "", ""
+                    for l in r.stdout.splitlines():
+                        ls = l.strip()
+                        if ls.startswith("level:"): level = ls.split()[-1]
+                        elif "AC powered" in ls: charging = "⚡" if "true" in ls else ""
+                    return f"{level}%{charging}"
+                def get_tun():
+                    pf = cfg.get("socks_pid_file", "")
+                    if os.path.exists(pf):
+                        try:
+                            with open(pf) as f: pid = int(f.read().strip())
+                            os.kill(pid, 0)
+                            return "on"
+                        except: pass
+                    return "off"
+                def get_kwx():
+                    try:
+                        r = subprocess.run(["ss", "-tulpn"], capture_output=True, text=True)
+                        return "on" if f":{cfg.get('kiwix_port', 8080)} " in r.stdout else "off"
+                    except: return "off"
+                fs = {
+                    "model": lambda: get("ro.product.model"),
+                    "battery": get_bat,
+                    "tunnel": get_tun,
+                    "kiwix": get_kwx,
+                }
+                for k, fn in fs.items():
+                    pool.submit(lambda k=k, fn=fn: data.update({k: fn()})).result()
+        if conn.ssh_ok:
+            data["ssh"] = "connected"
+        return data
+
+    class StatsBar(Static):
+        data = reactive({})
+
+        def watch_data(self, val):
+            self.update(self._format_stats(val))
+
+        def _format_stats(self, d):
+            line1 = ["[bold cyan]droid[/]"]
+            hostname = d.get("hostname", "")
+            if hostname and hostname != "?":
+                line1.append(f"🖥 {hostname}")
+            if d.get("model"):
+                label = d["model"]
+                if d.get("adb_serial"):
+                    label += f" [{d['adb_serial']}]"
+                line1.append(f"📱 {label}")
+            if d.get("battery"):
+                line1.append(f"🔋 {d['battery']}")
+            line1.append("│")
+            count = d.get("adb_count", 0)
+            color = "green" if d.get("adb") == "connected" else "red"
+            line1.append(f"[{color}]ADB({count})[/]")
+            color = "green" if d.get("ssh") == "connected" else "red"
+            line1.append(f"[{color}]SSH[/]")
+            kde = d.get("kde", "?")
+            color = "green" if kde not in ("0", "?", "err") else "red"
+            line1.append(f"[{color}]KDE {kde}[/]")
+            line1.append("│")
+            line1.append(f"🌐 {d.get('tunnel', 'off')}")
+            line1.append(f"📚 {d.get('kiwix', 'off')}")
+            out = "  ".join(line1)
+            serials = d.get("adb_serials", [])
+            preferred = d.get("preferred", "")
+            active = d.get("adb_serial", "")
+            if len(serials) > 1:
+                devs = []
+                for s in serials:
+                    entry = f"📱 {s}"
+                    if s == active:
+                        entry += "  ←"
+                    devs.append(entry)
+                out += "\n" + "  ".join(devs)
+            return out
+
+        def on_mount(self):
+            self.styles.background = "blue"
+            self.styles.padding = (0, 1)
+
+    class DroidTUI(App):
+        TITLE = "droid dashboard"
+        CSS = """
+        Screen { layout: grid; grid-size: 1; grid-rows: auto 1 auto; }
+        StatsBar { height: 2; min-height: 2; }
+        #actions { align: center middle; }
+        #actions Horizontal { height: 5; margin: 0 1; }
+        Button { width: 18; height: 3; margin: 0 1; }
+        Button:hover { background: $accent 50%; }
+        Button:focus { background: $accent; }
+        Footer { height: 1; }
+        """
+        BINDINGS = [
+            ("q", "quit", "Quit"),
+            ("r", "refresh", "Refresh"),
+            ("s", "ssh", "SSH"),
+            ("h", "shell", "Shell"),
+            ("m", "mount", "Mount"),
+            ("t", "tunnel", "Tunnel"),
+            ("M", "mirror", "Mirror"),
+            ("k", "kvm", "KVM"),
+            ("p", "screenshot", "Screenshot"),
+            ("v", "record", "Record"),
+            ("i", "info", "Info"),
+            ("w", "wake_sleep", "Wake/Sleep"),
+            ("b", "reboot", "Reboot"),
+            ("a", "app", "App"),
+            ("o", "modules", "Modules"),
+            ("d", "debloat", "Debloat"),
+            ("W", "wiki", "Wiki"),
+            ("c", "clip", "Clip"),
+            ("C", "droidconnect", "DroidC"),
+            ("K", "kdeconnect", "KDE"),
+            ("H", "home", "Home"),
+            ("D", "device", "Device"),
+            ("!", "host", "Host"),
+            ("@", "switch", "Switch"),
+            ("#", "devices", "Devices"),
+        ]
+
+        def __init__(self, cfg):
+            self._cfg = cfg
+            super().__init__()
+
+        def compose(self):
+            yield StatsBar(id="stats")
+            with Vertical(id="actions"):
+                yield Horizontal(
+                    Button("🔌 SSH", id="ssh", variant="primary"),
+                    Button("🖥️ Shell", id="shell"),
+                    Button("💾 Mount", id="mount"),
+                    Button("🌐 Tunnel", id="tunnel"),
+                    Button("🪞 Mirror", id="mirror"),
+                )
+                yield Horizontal(
+                    Button("⌨️ KVM", id="kvm", variant="primary"),
+                    Button("📸 Screenshot", id="screenshot"),
+                    Button("🎥 Record", id="record"),
+                    Button("ℹ️ Info", id="info"),
+                    Button("⏰ Wake", id="wake_sleep"),
+                )
+                yield Horizontal(
+                    Button("🔄 Reboot", id="reboot"),
+                    Button("📦 App", id="app"),
+                    Button("🧩 Modules", id="modules"),
+                    Button("🗑️ Debloat", id="debloat"),
+                    Button("📖 Wiki", id="wiki"),
+                )
+                yield Horizontal(
+                    Button("📋 Clip", id="clip"),
+                    Button("📱 KDE", id="kdeconnect"),
+                    Button("📟 Device", id="device"),
+                    Button("💻 Host", id="host"),
+                    Button("🏠 Home", id="home"),
+                )
+                yield Horizontal(
+                    Button("📦 DroidC", id="droidconnect"),
+                    Button("📱 Switch", id="switch", variant="primary"),
+                    Button("📋 Devices", id="devices"),
+                    Button("🔄 Refresh", id="refresh"),
+                    Button("❌ Quit", id="quit", variant="error"),
+                )
+            yield Footer()
+
+        def on_mount(self):
+            self.set_interval(POLL_INTERVAL, self._update_stats)
+            self._update_stats()
+
+        def _update_stats(self):
+            data = fetch_stats(self._cfg)
+            sb = self.query_one("#stats", StatsBar)
+            sb.data = data
+
+        def _run_cmd(self, cmd):
+            subprocess.Popen(cmd, stdout=NULL, stderr=NULL)
+
+        def _adb_cmd(self, subcmd, *args):
+            serials = _get_all_adb_serials()
+            cfg_check = load_config()
+            preferred = cfg_check.get("preferred_device", "")
+            if len(serials) > 1 and (not preferred or preferred not in serials):
+                self._run_cmd(["kitty", "-e", sys.argv[0], "switch"])
+            self._run_cmd(["kitty", "-e", sys.argv[0], subcmd] + list(args))
+
+        def on_button_pressed(self, event: Button.Pressed):
+            actions = {
+                "ssh": lambda: self._adb_cmd("ssh"),
+                "shell": lambda: self._adb_cmd("shell"),
+                "mount": lambda: self._adb_cmd("mount"),
+                "mirror": lambda: self._adb_cmd("mirror"),
+                "kvm": lambda: self._adb_cmd("kvm"),
+                "screenshot": lambda: self._adb_cmd("screenshot"),
+                "record": lambda: self._adb_cmd("record"),
+                "info": lambda: self._adb_cmd("info"),
+                "wake_sleep": lambda: self._run_cmd(
+                    ["kitty", "-e", "bash", "-c",
+                     f"{sys.argv[0]} wake; sleep 2; {sys.argv[0]} sleep"]),
+                "reboot": lambda: self._adb_cmd("reboot"),
+                "app": lambda: self._adb_cmd("app", "list"),
+                "modules": lambda: self._adb_cmd("modules", "list"),
+                "debloat": lambda: self._adb_cmd("debloat"),
+                "wiki": lambda: self._run_cmd(["kitty", "-e", sys.argv[0], "wiki"]),
+                "clip": lambda: self._adb_cmd("clip", "pull"),
+                "droidconnect": lambda: self._adb_cmd("droidconnect"),
+                "kdeconnect": lambda: self._run_cmd(["kitty", "-e", sys.argv[0], "kdeconnect", "list"]),
+                "home": lambda: self._run_cmd([sys.argv[0], "home"]),
+                "device": lambda: self._adb_cmd("device"),
+                "host": lambda: self._run_cmd(["kitty", "-e", sys.argv[0], "host"]),
+                "switch": lambda: self._run_cmd(["kitty", "-e", sys.argv[0], "switch"]),
+                "devices": lambda: self._run_cmd(["kitty", "-e", sys.argv[0], "devices"]),
+                "tunnel": lambda: self._run_cmd(["kitty", "-e", sys.argv[0], "tunnel", "toggle"]),
+                "refresh": self._update_stats,
+                "quit": self.exit,
+            }
+            action = actions.get(event.button.id)
+            if action:
+                action()
+
+        def action_refresh(self):
+            self._update_stats()
+
+        def _term_cmd(self, subcmd, *args):
+            return ["kitty", "-e", sys.argv[0], subcmd] + list(args)
+
+        def action_ssh(self): self._adb_cmd("ssh")
+        def action_shell(self): self._adb_cmd("shell")
+        def action_mount(self): self._adb_cmd("mount")
+        def action_tunnel(self): self._run_cmd(self._term_cmd("tunnel", "toggle"))
+        def action_mirror(self): self._adb_cmd("mirror")
+        def action_kvm(self): self._adb_cmd("kvm")
+        def action_screenshot(self): self._adb_cmd("screenshot")
+        def action_record(self): self._adb_cmd("record")
+        def action_info(self): self._adb_cmd("info")
+        def action_wake_sleep(self): self._run_cmd(["kitty", "-e", "bash", "-c",
+            f"{sys.argv[0]} wake; sleep 2; {sys.argv[0]} sleep"])
+        def action_reboot(self): self._adb_cmd("reboot")
+        def action_app(self): self._adb_cmd("app", "list")
+        def action_modules(self): self._adb_cmd("modules", "list")
+        def action_debloat(self): self._adb_cmd("debloat")
+        def action_wiki(self): self._run_cmd(self._term_cmd("wiki"))
+        def action_clip(self): self._adb_cmd("clip", "pull")
+        def action_droidconnect(self): self._adb_cmd("droidconnect")
+        def action_kdeconnect(self): self._run_cmd(self._term_cmd("kdeconnect", "list"))
+        def action_home(self): self._run_cmd([sys.argv[0], "home"])
+        def action_device(self): self._adb_cmd("device")
+        def action_host(self): self._run_cmd(self._term_cmd("host"))
+        def action_switch(self): self._run_cmd(self._term_cmd("switch"))
+        def action_devices(self): self._run_cmd(self._term_cmd("devices"))
+
+    DroidTUI(load_config()).run()
+
+
+# ── CLI ───────────────────────────────────────────────────────────────────────
+
+def make_parser():
+    p = argparse.ArgumentParser(
+        prog="droid",
+        description=f"Unified Android device management tool v{VERSION}",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  droid                           Show all panels (devices, host, status, info)
+  droid host                      Show local host info
+  droid device                    Show detected device info
+  droid devices                   List all ADB devices
+  droid switch                    Switch active ADB device
+  droid ssh                       SSH into phone
+  droid dashboard                 TUI dashboard (requires textual)
+  droid shell [cmd]               Interactive shell (SSH > ADB)
+  droid mount                     Mount phone filesystem
+  droid tunnel on                 Start DPI bypass tunnel
+  droid kvm                       Seamless KVM mode (Hyprland)
+  droid mirror [--bitrate 8M]     Mirror phone screen
+  droid screenshot [path]         Take screenshot
+  droid record [--time N] [path]  Record screen
+  droid info                      Extended device info
+  droid clip push|pull            Clipboard sync
+  droid wake|sleep                Screen on/off
+  droid reboot [mode]             Reboot device
+  droid forward list|add|rm PORT  ADB port forwarding
+  droid app install vlc           Search & install app
+  droid debloat                   Debloat with default profile
+  droid wiki                      Start Kiwix server
+  droid init                      Probe + check dependencies
+  droid config [--show]           View/edit configuration
+        """
+    )
+    p.add_argument("--version", action="version", version=f"droid v{VERSION}")
+    p.add_argument("--device", "-d", help="ADB device serial (for multi-device)")
+
+    sub = p.add_subparsers(dest="command")
+
+    # device
+    sub.add_parser("device", help="Show detected device info")
+
+    # host
+    sub.add_parser("host", help="Show local host info")
+
+    # devices / switch
+    sub.add_parser("devices", help="List all connected ADB devices")
+    sub.add_parser("switch", help="Switch active ADB device")
+
+    # ssh
+    sub.add_parser("ssh", help="SSH into phone")
+
+    # shell
+    shp = sub.add_parser("shell", help="Interactive phone shell (SSH > ADB)")
+    shp.add_argument("cmd", nargs="?", help="Optional command to run")
+
+    # status (no args → status)
+    sub.add_parser("status", help="One-shot status dashboard",
+                   aliases=["st"])
+
+    # screenshot
+    scp = sub.add_parser("screenshot", help="Take phone screenshot",
+                         aliases=["ss"])
+    scp.add_argument("path", nargs="?", help="Save path")
+
+    # record
+    rcp = sub.add_parser("record", help="Record phone screen",
+                         aliases=["rec"])
+    rcp.add_argument("--time", "-t", type=int, help="Time limit (seconds)")
+    rcp.add_argument("path", nargs="?", help="Save path")
+
+    # info
+    sub.add_parser("info", help="Extended device info")
+
+    # clip
+    clip = sub.add_parser("clip", help="Clipboard push/pull")
+    clip.add_argument("direction", choices=["push", "pull"],
+                      help="push (PC→phone) or pull (phone→PC)")
+
+    # wake
+    sub.add_parser("wake", help="Wake up device screen")
+
+    # sleep
+    sub.add_parser("sleep", help="Put device to sleep")
+
+    # reboot
+    rbp = sub.add_parser("reboot", help="Reboot device")
+    rbp.add_argument("mode", nargs="?", choices=["recovery", "bootloader"],
+                     help="Boot mode")
+
+    # forward
+    fwp = sub.add_parser("forward", help="ADB port forwarding")
+    fwp.add_argument("action", choices=["list", "add", "rm", "rm-all"],
+                     help="Action")
+    fwp.add_argument("port", nargs="?", type=int, help="TCP port")
+
+    # mount
+    mp = sub.add_parser("mount", help="Mount/unmount phone via SSHFS")
+    mp.add_argument("action", choices=["mount", "unmount"], default="mount", nargs="?",
+                    help="mount or unmount")
+
+    # tunnel
+    tp = sub.add_parser("tunnel", help="DPI bypass SOCKS5 tunnel",
+                        aliases=["dpi"])
+    tp.add_argument("action", choices=["on", "off", "toggle", "status"],
+                    default="toggle", nargs="?",
+                    help="toggle on/off (default: toggle)")
+
+    # home
+    sub.add_parser("home", help="Send HOME key to Android")
+
+    # kvm
+    sub.add_parser("kvm", help="Seamless KVM mode (edge swipe + RCtrl)")
+
+    # app
+    ap = sub.add_parser("app", help="Manage Android apps")
+    ap_sub = ap.add_subparsers(dest="subcommand")
+    ap_sub.add_parser("local", help="Install from local APK files")
+    inst = ap_sub.add_parser("install", aliases=["search"],
+                             help="Search Play Store & install")
+    inst.add_argument("query", nargs="*", help="App name to search")
+    uninst = ap_sub.add_parser("uninstall", help="Uninstall an app")
+    uninst.add_argument("query", nargs="*", help="Package name or filter")
+    lst = ap_sub.add_parser("list", help="List installed apps")
+    lst.add_argument("query", nargs="*", help="Optional filter")
+
+    # modules
+    modp = sub.add_parser("modules", help="Manage Magisk modules",
+                          aliases=["mod"])
+    mod_sub = modp.add_subparsers(dest="module_subcommand")
+    mod_sub.add_parser("list", help="List installed modules")
+    mod_sub.add_parser("remove", help="Mark module for removal")
+    mod_sub.add_parser("flash", help="Flash module from local dir")
+
+    # debloat
+    dp = sub.add_parser("debloat", help="Remove bloatware")
+    dp.add_argument("--profile", "-p", help="Debloat profile name")
+    dp.add_argument("--list-profiles", action="store_true",
+                    help="List available profiles")
+    dp.add_argument("--list-packages", action="store_true",
+                    help="List packages in selected profile")
+
+    # mirror
+    mp2 = sub.add_parser("mirror", help="Mirror phone screen on PC")
+    mp2.add_argument("--workspace", "-w", type=int, default=2,
+                     help="Hyprland workspace (default: 2)")
+    mp2.add_argument("--bitrate", "-b", default="4M",
+                     help="Video bitrate (default: 4M, use 8M for high quality)")
+
+    # launch
+    lp = sub.add_parser("launch", help="Launch Android app via fuzzel + scrcpy",
+                        aliases=["app-launch"])
+    lp.add_argument("--portrait", "-p", action="store_true",
+                    help="Use portrait phone-sized display")
+    lp.add_argument("--pkg", help="Package name (skip fuzzel picker)")
+
+    # external-launch
+    el = sub.add_parser("external-launch", help="Launch app on external monitor",
+                        aliases=["ext-launch"])
+    el.add_argument("--display-id", "-d", type=int, default=None,
+                    help="Target display ID (auto-detected if omitted)")
+
+    # kdeconnect
+    kcp = sub.add_parser("kdeconnect", help="KDE Connect integration",
+                         aliases=["kde"])
+    kcp.add_argument("action", choices=["list", "ping", "find", "send-file",
+                                        "share-url", "sms", "list-files", "share-clip"],
+                     help="Action")
+    kcp.add_argument("--device", "-d", help="Device ID")
+    kcp.add_argument("--file", help="File path to send")
+    kcp.add_argument("--url", help="URL to share")
+    kcp.add_argument("--number", help="Phone number for SMS")
+    kcp.add_argument("--message", help="SMS message text")
+
+    # droidconnect
+    dc = sub.add_parser("droidconnect", help="DroidSpaces container access",
+                        aliases=["dsc"])
+    dc.add_argument("--x11", action="store_true", help="Enable X11 bridge")
+    dc.add_argument("--container", "-c", default="",
+                    help="Container name (auto-detected if omitted)")
+    dc.add_argument("--cmd", help="Command to run in container")
+
+    # wiki
+    wp = sub.add_parser("wiki", help="Kiwix offline Wikipedia server")
+    wp.add_argument("--stop", action="store_true", help="Stop the server")
+
+    # music
+    mup = sub.add_parser("music", help="Download YouTube audio/video",
+                         aliases=["yt"])
+    mup.add_argument("url", nargs="?", help="YouTube URL")
+    mup.add_argument("--dir", "-d", help="Target subfolder")
+    mup.add_argument("--mode", "-m", type=int, choices=[1, 2],
+                     help="1=audio, 2=video")
+
+    # config
+    cp = sub.add_parser("config", help="View/edit configuration")
+    cp.add_argument("--show", action="store_true", help="Show config")
+    cp.add_argument("--set", dest="set_key", metavar="KEY",
+                    help="Set config key")
+    cp.add_argument("--val", dest="set_val", metavar="VALUE",
+                    help="Value to set")
+    cp.add_argument("--reset", action="store_true", help="Reset to defaults")
+
+    # dashboard
+    sub.add_parser("dashboard", help="Interactive TUI dashboard with live stats + action grid",
+                   aliases=["dash", "ui"])
+
+    # init
+    sub.add_parser("init", help="Probe connection and check dependencies")
+
+    return p
+
+
+def cmd_default(args):
+    """Default: keyboard-navigable menu interface"""
+    cfg = load_config()
+    conn = resolve_connection(cfg)
+    from concurrent.futures import ThreadPoolExecutor as TPE
+
+    phone = {}
+    host = _get_host_info()
+
+    def get(prop):
+        if not conn.adb_ok or not conn.adb_serial:
+            return "?"
+        r = subprocess.run(["adb", "-s", conn.adb_serial, "shell", f"getprop {prop}"],
+                           capture_output=True, text=True, timeout=5)
+        return r.stdout.strip() or "?"
+
+    def get_cmd(cmd):
+        if not conn.adb_ok or not conn.adb_serial:
+            return "?"
+        r = subprocess.run(["adb", "-s", conn.adb_serial, "shell", cmd],
+                           capture_output=True, text=True, timeout=5)
+        return r.stdout.strip() or "?"
+
+    def get_bat():
+        if not conn.adb_ok or not conn.adb_serial:
+            return "?"
+        r = subprocess.run(["adb", "-s", conn.adb_serial, "shell", "dumpsys", "battery"],
+                           capture_output=True, text=True, timeout=5)
+        level = ""
+        for l in r.stdout.splitlines():
+            ls = l.strip()
+            if ls.startswith("level:"):
+                level = ls.split()[-1] + "%"
+                break
+        return level or "?"
+
+    if conn.adb_ok:
+        with TPE(max_workers=4) as pool:
+            futs = {
+                "model": pool.submit(lambda: get("ro.product.model")),
+                "android": pool.submit(lambda: get("ro.build.version.release")),
+                "battery": pool.submit(get_bat),
+                "ram": pool.submit(lambda: get_cmd("cat /proc/meminfo | grep MemTotal")),
+                "storage": pool.submit(lambda: get_cmd("df -h /data | tail -1")),
+                "display": pool.submit(lambda: get_cmd("wm size")),
+            }
+            phone["model"] = futs["model"].result()
+            phone["android"] = futs["android"].result()
+            phone["battery"] = futs["battery"].result()
+            ram_raw = futs["ram"].result()
+            m = re.search(r'(\d+)', ram_raw)
+            phone["ram"] = f"{int(m.group(1)) / 1024 / 1024:.1f} GiB" if m else "?"
+            storage_raw = futs["storage"].result()
+            parts = storage_raw.split()
+            phone["storage"] = f"{parts[1]}·{parts[3]} free" if len(parts) >= 5 else "?"
+            display_raw = futs["display"].result()
+            phone["display"] = display_raw.replace("Physical size:", "").strip() or "?"
+
+    adb_serials = _get_all_adb_serials()
+    preferred = cfg.get("preferred_device", "")
+    active = conn.adb_serial or preferred or (adb_serials[0] if len(adb_serials) == 1 else "")
+
+    tun_on = os.path.exists(cfg.get("socks_pid_file", ""))
+    kwx_on = False
+    try:
+        r = subprocess.run(["ss", "-tulpn"], capture_output=True, text=True)
+        kwx_on = f":{cfg.get('kiwix_port', 8080)} " in r.stdout
+    except:
+        pass
+    kde_count = "?"
+    if shutil.which("kdeconnect-cli"):
+        try:
+            r = subprocess.run(["kdeconnect-cli", "-l", "--id-only"],
+                               capture_output=True, text=True, timeout=5)
+            kde_list = [l.strip() for l in r.stdout.splitlines() if l.strip()]
+            kde_count = str(len(kde_list))
+        except:
+            pass
+
+    if RICH:
+        _console = Console()
+
+        model = phone.get("model", "?")
+        bat = phone.get("battery", "?")
+        android = phone.get("android", "?")
+        serial = active
+        ram = phone.get("ram", "")
+        storage = phone.get("storage", "")
+        display = phone.get("display", "")
+
+        # ── Left panel: device info ──
+        left_lines = []
+        left_lines.append(f"📱 {model}" + (f" [{serial}]" if serial else ""))
+        if bat and bat != "?": left_lines.append(f"🔋 {bat}")
+        if android and android != "?": left_lines.append(f"🤖 Android {android}")
+        if ram: left_lines.append(f"💾 {ram}")
+        if storage: left_lines.append(f"💽 {storage}")
+        if display: left_lines.append(f"🖥 {display}")
+        left_lines.append("")
+        left_lines.append(f"🖥 {host.get('hostname', '?')}")
+        os_name = host.get("os", "")
+        if os_name: left_lines.append(f"  {os_name}")
+        kernel = host.get("kernel", "")
+        if kernel: left_lines.append(f"🐧 {kernel.split('-')[0] if '-' in kernel else kernel}")
+        left_lines.append("")
+        adb_count = len(adb_serials)
+        left_lines.append(f"🔌 ADB ({adb_count}) {'✓' if conn.adb_ok else '✗'}")
+        left_lines.append(f"🖥 SSH {'✓' if conn.ssh_ok else '✗'}")
+        left_lines.append(f"📡 KDE {kde_count}")
+        left_lines.append(f"🌐 Tunnel {'on' if tun_on else 'off'}")
+        left_lines.append(f"📚 Kiwix {'on' if kwx_on else 'off'}")
+
+        left_table = Table.grid(padding=(0, 2))
+        left_table.add_column()
+        for line in left_lines:
+            left_table.add_row(line)
+        left_panel = Panel(left_table, border_style="blue")
+
+        # ── Right panel: 2-column menu ──
+
+
+        # ── Non-TTY fallback: just show left panel ──
+        if not sys.stdin.isatty():
+            _console.print(left_panel)
+            return
+        import termios, tty
+
+        def _getch() -> str:
+            fd = sys.stdin.fileno()
+            old = termios.tcgetattr(fd)
+            try:
+                tty.setraw(fd)
+                ch = os.read(fd, 1).decode()
+                if ch == '\x1b':
+                    import select
+                    if select.select([sys.stdin], [], [], 0.05)[0]:
+                        ch += os.read(fd, 2).decode()
+                return ch
+            finally:
+                termios.tcsetattr(fd, termios.TCSADRAIN, old)
+
+        def _run(args_list, term=False):
+            if term:
+                subprocess.Popen(["kitty", "-e", sys.argv[0]] + args_list, stdout=NULL, stderr=NULL)
+            else:
+                try:
+                    r = subprocess.run([sys.argv[0]] + args_list, capture_output=True, text=True, timeout=30)
+                    out = (r.stdout + r.stderr).strip()
+                except subprocess.TimeoutExpired:
+                    out = "Command timed out"
+                if out:
+                    _console.print(Panel(out, border_style="dim"))
+                    _getch()
+
+        def _nav(items, title="Menu", back=True):
+            """Navigable menu using arrow/jk keys. Enter to select, Esc/q to go back."""
+            cursor = 0
+            while True:
+                _console.clear()
+                split = Table.grid(expand=True)
+                split.add_column(ratio=3)
+                split.add_column(ratio=7)
+                right = Table.grid(padding=(0, 1))
+                right.add_column()
+                right.add_row(f"\n[bold cyan]{title}[/]")
+                right.add_row("─" * 34)
+                for i, item in enumerate(items):
+                    marker = "[reverse]▸[/]" if i == cursor else " "
+                    label = item.get("label", "")
+                    right.add_row(f"  {marker}  {label}")
+                if back:
+                    bmarker = "[reverse]▸[/]" if cursor == len(items) else " "
+                    right.add_row("")
+                    right.add_row(f"  {bmarker}  ◂  Back")
+                right.add_row("")
+                right.add_row("[dim]↑↓/jk navigate  Enter select  Esc/q back[/]")
+                split.add_row(left_panel, Panel(right, title="Menu", border_style="green"))
+                _console.print(split)
+
+                key = _getch()
+                if key == 'q' or key == '\x1b':
+                    return
+                if key == '\x03':
+                    sys.exit(0)
+                if key in ('j', '\x1b[B'):  # down
+                    cursor = min(cursor + 1, len(items))
+                elif key in ('k', '\x1b[A'):  # up
+                    cursor = max(cursor - 1, 0)
+                elif key in ('\r', '\n'):
+                    if cursor == len(items) and back:
+                        return
+                    item = items[cursor]
+                    if "items" in item:
+                        _nav(item["items"], item["label"])
+                        cursor = 0
+                    elif "action" in item:
+                        item["action"]()
+                        cursor = 0
+                elif key == 'g':
+                    cursor = 0
+                elif key == 'G':
+                    cursor = len(items)
+
+        menu_tree = [
+            {"label": "Device Actions", "items": [
+                {"label": "SSH", "action": lambda: _run(["ssh"], True)},
+                {"label": "Shell", "action": lambda: _run(["shell"], True)},
+                {"label": "Mount", "items": [
+                    {"label": "Mount phone", "action": lambda: _run(["mount", "mount"], True)},
+                    {"label": "Unmount", "action": lambda: _run(["mount", "unmount"], True)},
+                ]},
+                {"label": "Mirror (scrcpy)", "items": [
+                    {"label": "Normal (4M)", "action": lambda: _run(["mirror"], True)},
+                    {"label": "DeX quality (8M)", "action": lambda: _run(["mirror", "--bitrate", "8M"], True)},
+                    {"label": "Full quality (12M)", "action": lambda: _run(["mirror", "--bitrate", "12M"], True)},
+                    {"label": "Workspace 2", "action": lambda: _run(["mirror", "--workspace", "2"], True)},
+                    {"label": "Workspace 3", "action": lambda: _run(["mirror", "--workspace", "3"], True)},
+                ]},
+                {"label": "DeX", "items": [
+                    {"label": "Mirror + pick app", "action": lambda: (
+                        subprocess.Popen([sys.argv[0], "mirror", "--bitrate", "8M"], stdout=NULL, stderr=NULL),
+                        _run(["launch"], False),
+                    )},
+                    {"label": "Mirror + launch by pkg", "action": lambda: (
+                        subprocess.Popen([sys.argv[0], "mirror", "--bitrate", "8M"], stdout=NULL, stderr=NULL),
+                        _run(["launch", "--pkg"], False),
+                    )},
+                ]},
+                {"label": "Info", "action": lambda: _run(["info"], False)},
+                {"label": "Screenshot", "action": lambda: _run(["screenshot"], False)},
+                {"label": "Record", "items": [
+                    {"label": "Record 30s", "action": lambda: _run(["record", "--time", "30"], True)},
+                    {"label": "Record 60s", "action": lambda: _run(["record", "--time", "60"], True)},
+                    {"label": "Record (manual stop)", "action": lambda: _run(["record"], True)},
+                ]},
+                {"label": "Wake/Sleep", "items": [
+                    {"label": "Wake → Sleep cycle", "action": lambda: (
+                        subprocess.run([sys.argv[0], "wake"]), _console.print("[dim]Woken, sleeping in 2s...[/]"),
+                        subprocess.run(["sleep", "2"]), subprocess.run([sys.argv[0], "sleep"]), _getch(),
+                    )},
+                    {"label": "Just wake", "action": lambda: (subprocess.run([sys.argv[0], "wake"]), _getch())},
+                    {"label": "Just sleep", "action": lambda: (subprocess.run([sys.argv[0], "sleep"]), _getch())},
+                ]},
+                {"label": "Home", "action": lambda: _run(["home"], False)},
+                {"label": "Reboot", "items": [
+                    {"label": "Normal reboot", "action": lambda: _run(["reboot"], True)},
+                    {"label": "Recovery mode", "action": lambda: _run(["reboot", "recovery"], True)},
+                    {"label": "Bootloader", "action": lambda: _run(["reboot", "bootloader"], True)},
+                ]},
+            ]},
+            {"label": "Apps & Modules", "items": [
+                {"label": "App list", "action": lambda: _run(["app", "list"], False)},
+                {"label": "Search & install", "action": lambda: _run(["app", "install"], True)},
+                {"label": "Uninstall app", "action": lambda: _run(["app", "uninstall"], True)},
+                {"label": "Install local APK", "action": lambda: _run(["app", "local"], True)},
+                {"label": "Modules", "items": [
+                    {"label": "List modules", "action": lambda: _run(["modules", "list"], False)},
+                    {"label": "Remove module", "action": lambda: _run(["modules", "remove"], True)},
+                    {"label": "Flash module", "action": lambda: _run(["modules", "flash"], True)},
+                ]},
+                {"label": "Debloat", "items": [
+                    {"label": "Default profile", "action": lambda: _run(["debloat"], True)},
+                    {"label": "Samsung profile", "action": lambda: _run(["debloat", "--profile", "samsung"], True)},
+                    {"label": "List profiles", "action": lambda: _run(["debloat", "--list-profiles"], False)},
+                    {"label": "List packages", "action": lambda: _run(["debloat", "--list-packages"], False)},
+                ]},
+                {"label": "Launch app", "items": [
+                    {"label": "Pick app (fuzzel)", "action": lambda: _run(["launch"], True)},
+                    {"label": "By package name", "action": lambda: _run(["launch", "--pkg"], True)},
+                    {"label": "Portrait mode", "action": lambda: _run(["launch", "--portrait"], True)},
+                ]},
+            ]},
+            {"label": "Network", "items": [
+                {"label": "Tunnel", "items": [
+                    {"label": "Toggle", "action": lambda: _run(["tunnel", "toggle"], False)},
+                    {"label": "Start", "action": lambda: _run(["tunnel", "on"], False)},
+                    {"label": "Stop", "action": lambda: _run(["tunnel", "off"], False)},
+                    {"label": "Status", "action": lambda: _run(["tunnel", "status"], False)},
+                ]},
+                {"label": "Kiwix Wiki", "items": [
+                    {"label": "Start", "action": lambda: _run(["wiki"], False)},
+                    {"label": "Stop", "action": lambda: _run(["wiki", "--stop"], False)},
+                ]},
+                {"label": "Music/YT", "items": [
+                    {"label": "Download audio", "action": lambda: _run(["music", "--mode", "1"], True)},
+                    {"label": "Download video", "action": lambda: _run(["music", "--mode", "2"], True)},
+                ]},
+                {"label": "KDE Connect", "items": [
+                    {"label": "List devices", "action": lambda: _run(["kdeconnect", "list"], False)},
+                    {"label": "Ping device", "action": lambda: _run(["kdeconnect", "ping"], True)},
+                    {"label": "Find device", "action": lambda: _run(["kdeconnect", "find"], True)},
+                    {"label": "Send file", "action": lambda: _run(["kdeconnect", "send-file"], True)},
+                    {"label": "Share URL", "action": lambda: _run(["kdeconnect", "share-url"], True)},
+                    {"label": "SMS", "action": lambda: _run(["kdeconnect", "sms"], True)},
+                    {"label": "Share clipboard", "action": lambda: _run(["kdeconnect", "share-clip"], False)},
+                    {"label": "List files", "action": lambda: _run(["kdeconnect", "list-files"], True)},
+                ]},
+            ]},
+            {"label": "System", "items": [
+                {"label": "Device info", "action": lambda: _run(["device"], False)},
+                {"label": "Host info", "action": lambda: _run(["host"], False)},
+                {"label": "List ADB devices", "action": lambda: _run(["devices"], False)},
+                {"label": "Switch device", "action": lambda: _run(["switch"], True)},
+                {"label": "DroidConnect", "items": [
+                    {"label": "Connect", "action": lambda: _run(["droidconnect"], True)},
+                    {"label": "With X11 bridge", "action": lambda: _run(["droidconnect", "--x11"], True)},
+                ]},
+                {"label": "Clipboard", "items": [
+                    {"label": "Pull from phone", "action": lambda: _run(["clip", "pull"], False)},
+                    {"label": "Push to phone", "action": lambda: _run(["clip", "push"], False)},
+                ]},
+            ]},
+            {"label": "Help", "items": [
+                {"label": "About droid", "action": lambda: (
+                    _console.print(Panel(
+                        f"droid v{VERSION}\nUnified Android device management\n\n"
+                        f"↑↓/jk navigate   Enter select   Esc/q back",
+                        title="About", border_style="cyan"
+                    )), _getch()
+                )},
+            ]},
+        ]
+
+        _nav(menu_tree, "Main Menu", back=False)
+        return
+
+    # Plain fallback
+    print(f"\n  📱 {phone.get('model', '?')}  [{active}]  🔋 {phone.get('battery', '?')}  🤖 {phone.get('android', '?')}")
+    extras = []
+    if phone.get("ram"): extras.append(f"💾 {phone['ram']}")
+    if phone.get("storage"): extras.append(f"💽 {phone['storage']}")
+    if phone.get("display"): extras.append(f"🖥 {phone['display']}")
+    if extras:
+        print(f"  {'  '.join(extras)}")
+    print(f"  🖥 {host.get('hostname', '?')}  🐧 {host.get('kernel', '?')}")
+    print(f"  🔌 ADB({adb_count}) {'✓' if conn.adb_ok else '✗'}  🖥 SSH {'✓' if conn.ssh_ok else '✗'}  📡 KDE {kde_count}  🌐 {'on' if tun_on else 'off'}  📚 {'on' if kwx_on else 'off'}")
+    if sys.stdin.isatty():
+        try:
+            import termios, tty
+            def _getch():
+                fd = sys.stdin.fileno()
+                old = termios.tcgetattr(fd)
+                try:
+                    tty.setraw(fd)
+                    return sys.stdin.read(1)
+                finally:
+                    termios.tcsetattr(fd, termios.TCSADRAIN, old)
+            while True:
+                key = _getch()
+                if key == 'q':
+                    break
+                if key == '\x03':
+                    sys.exit(0)
+        except ImportError:
+            pass
+
+
+def main():
+    p = make_parser()
+    args = p.parse_args()
+
+    if args.device:
+        cfg = load_config()
+        cfg["preferred_device"] = args.device
+        save_config(cfg)
+
+    if not args.command:
+        cmd_default(args)
+        return
+
+    # Map commands to handlers
+    handlers = {
+        "device": cmd_device,
+        "host": cmd_host,
+        "devices": cmd_devices,
+        "switch": cmd_switch,
+        "ssh": cmd_ssh,
+        "shell": cmd_shell,
+        "status": cmd_status,
+        "st": cmd_status,
+        "screenshot": cmd_screenshot,
+        "ss": cmd_screenshot,
+        "record": cmd_record,
+        "rec": cmd_record,
+        "info": cmd_info,
+        "clip": cmd_clip,
+        "wake": cmd_wake,
+        "sleep": cmd_sleep,
+        "reboot": cmd_reboot,
+        "forward": cmd_forward,
+        "mount": cmd_mount,
+        "tunnel": cmd_tunnel,
+        "dpi": cmd_tunnel,
+        "home": cmd_home,
+        "kvm": cmd_kvm,
+        "app": cmd_app,
+        "modules": cmd_app_modules,
+        "mod": cmd_app_modules,
+        "debloat": cmd_debloat,
+        "mirror": cmd_mirror,
+        "launch": cmd_launch,
+        "app-launch": cmd_launch,
+        "external-launch": cmd_external_launch,
+        "ext-launch": cmd_external_launch,
+        "kdeconnect": cmd_kdeconnect,
+        "kde": cmd_kdeconnect,
+        "droidconnect": cmd_droidconnect,
+        "dsc": cmd_droidconnect,
+        "wiki": cmd_wiki,
+        "music": cmd_music,
+        "yt": cmd_music,
+        "dashboard": cmd_dashboard,
+        "dash": cmd_dashboard,
+        "config": cmd_config,
+        "init": cmd_init,
+    }
+
+    handler = handlers.get(args.command)
+    if handler:
+        handler(args)
+    else:
+        p.print_help()
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,93 @@
+{
+  "ssh_interface": "",
+  "ssh_port": 0,
+  "ssh_user": "",
+  "ssh_key": "",
+  "droid_container": "",
+  "adb_connect_auto": true,
+  "adb_connect_string": "",
+  "preferred_device": "",
+  "mount_point": "/mnt/phone",
+  "storage_mount": "/mnt/phone-storage",
+  "apk_dir": "~/apkget/apks",
+  "modules_dir": "~/apkget/modules",
+  "socks_port": 1080,
+  "socks_pid_file": "/tmp/droid-tunnel.pid",
+  "kiwix_zim_dir": "~/Kiwix",
+  "kiwix_port": 8080,
+  "music_base_dir": "~/Music",
+  "default_debloat_profile": "generic",
+  "debloat_profiles": {
+    "generic": {
+      "meta": [
+        "com.facebook.katana",
+        "com.facebook.appmanager",
+        "com.facebook.system",
+        "com.facebook.services"
+      ],
+      "social": [
+        "com.instagram.android",
+        "com.linkedin.android"
+      ],
+      "microsoft": [],
+      "google": [
+        "com.google.android.apps.youtube.music",
+        "com.google.android.videos",
+        "com.spotify.music"
+      ],
+      "carrier": [],
+      "other": []
+    },
+    "samsung": {
+      "meta": [
+        "com.facebook.katana",
+        "com.facebook.appmanager",
+        "com.facebook.system",
+        "com.facebook.services"
+      ],
+      "social": [
+        "com.instagram.android",
+        "com.linkedin.android"
+      ],
+      "microsoft": [
+        "com.microsoft.office.officehubrow",
+        "com.microsoft.office.outlook",
+        "com.microsoft.skydrive",
+        "com.microsoft.appmanager"
+      ],
+      "samsung": [
+        "com.samsung.android.app.spage",
+        "com.samsung.android.visionintelligence",
+        "com.samsung.android.intellivoiceservice",
+        "com.samsung.android.bixbyvision.framework",
+        "com.samsung.android.samsungpass",
+        "com.samsung.android.samsungpassautofill",
+        "com.samsung.android.game.gamehome",
+        "com.samsung.android.game.gametools",
+        "com.samsung.android.game.gos",
+        "com.samsung.android.app.reminder",
+        "com.samsung.android.forest",
+        "com.samsung.android.rubin.app",
+        "com.samsung.android.app.dressroom",
+        "com.samsung.android.tvplus",
+        "com.samsung.android.smartswitchassistant",
+        "com.samsung.android.voc",
+        "com.samsung.sree",
+        "com.sec.android.app.kidshome",
+        "com.samsung.android.kidsinstaller",
+        "com.sec.android.emergencylauncher",
+        "com.samsung.android.emergency",
+        "com.sec.android.app.sbrowser"
+      ],
+      "google": [
+        "com.google.android.apps.youtube.music",
+        "com.google.android.videos",
+        "com.spotify.music"
+      ],
+      "carrier": [
+        "com.rsupport.rs.activity.rsupport.aas2"
+      ],
+      "other": []
+    }
+  }
+}

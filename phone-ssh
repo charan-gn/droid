@@ -1,0 +1,6 @@
+#!/bin/bash
+PHONE_IP=$(ip route | grep 'dev eno1' | awk '{print $3}' | head -1)
+[ -z "$PHONE_IP" ] && PHONE_IP=$(ip neighbor show dev eno1 | awk '{print $1}' | head -1)
+[ -z "$PHONE_IP" ] && { echo "Phone not found."; exit 1; }
+sed -i "s/HostName .*/HostName $PHONE_IP/" ~/.ssh/config
+exec ssh phone

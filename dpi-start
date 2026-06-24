@@ -1,0 +1,15 @@
+#!/bin/bash
+sleep 3  # wait for tethering IP to be assigned
+PHONE_IP=$(ip -4 route show dev eno1 | awk '/^default/ {print $3}' | head -n 1)
+[ -z "$PHONE_IP" ] && PHONE_IP=$(ip -4 neighbor show dev eno1 | awk '{print $1}' | grep -v 'FAILED' | head -n 1)
+[ -z "$PHONE_IP" ] && exit 1
+
+# Kill any existing tunnel
+pkill -f "ssh -D 1080" 2>/dev/null
+
+ssh -D 1080 -q -N \
+    -o StrictHostKeyChecking=no \
+    -o UserKnownHostsFile=/dev/null \
+    -o ServerAliveInterval=30 \
+    -p 2222 charan@$PHONE_IP &
+echo $! > /tmp/dpi-tunnel.pid
